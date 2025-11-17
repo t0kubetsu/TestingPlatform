@@ -50,7 +50,6 @@ jsonschema-specifications
 jsonschema
 junit-xml
 numpy
-onekey-client
 pandas
 pillow
 psutil
