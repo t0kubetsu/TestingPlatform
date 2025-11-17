@@ -1,0 +1,25 @@
+services:
+  db:
+    image: postgres
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: change_me
+      POSTGRES_DB: testing-platform
+    volumes:
+      - pgdata:/var/lib/postgresql
+ 
+  testing-platform:
+    build: .
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: change_me
+      POSTGRES_DB: testing-platform
+      SECRET_KEY: change_me
+    ports:
+      - "80:8000"
+    depends_on:
+      - db
+
+volumes:
+  pgdata:
