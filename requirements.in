@@ -26,4 +26,5 @@ python-decouple
 python3-nmap
 pyvulnerabilitylookup
 redis
+validators
 weasyprint
