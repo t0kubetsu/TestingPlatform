@@ -1,44 +1,47 @@
+import base64
+import hashlib
 import json
+import logging
 import os
 import re
+import smtplib as smtp
+import socket
+import ssl
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone, timedelta
-from dateutil.relativedelta import relativedelta
 from base64 import b64decode
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
-from typing import Any, Union, Dict, List, Tuple, Optional
-from bs4 import BeautifulSoup
-import dns.resolver
+from typing import Any, Dict, List, Optional, Tuple, Union
+from urllib.parse import urljoin, urlparse
+
 import dns.dnssec
-import dns.name
-import ssl
-import socket
 import dns.message
+import dns.name
 import dns.rdatatype
+import dns.resolver
 import nmap3
 import pypandora
 import requests
-import hashlib
-import base64
-import smtplib as smtp
-from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urljoin, urlparse, urlunparse
+import validators
+from bs4 import BeautifulSoup
 from Crypto.PublicKey import RSA
+from dateutil.relativedelta import relativedelta
 from django.template.loader import render_to_string
-from weasyprint import CSS, HTML
-import logging
-from testing import validators
-from testing_platform.settings import PANDORA_ROOT_URL
-from .cipher_scoring import load_cipher_info
 from pyvulnerabilitylookup import PyVulnerabilityLookup
+from weasyprint import CSS, HTML
+
+from testing_platform.settings import MAX_UPLOAD_FILE_SIZE, PANDORA_ROOT_URL
+
+from .cipher_scoring import load_cipher_info
 
 logger = logging.getLogger(__name__)
 
-# Allowlisted protocols for URL construction
-ALLOWED_PROTOCOLS = ["http", "https"]
+ALLOWED_SCHEME = ["http", "https"]
+
 
 def extract_domain_from_url(url: str) -> str:
     """
@@ -48,42 +51,35 @@ def extract_domain_from_url(url: str) -> str:
         url (str): The URL or domain string
 
     Returns:
-        str: Just the domain part of the URL
+        str: Just the domain part of the URL or an empty string
     """
-    if not url or not isinstance(url, str):
-        logger.error(f"Invalid URL input: {url}")
-        return ""
-
     original_url = url
-
-    # Remove any leading/trailing whitespace
     url = url.strip()
 
-    # If URL starts with a protocol prefix, extract the domain
-    if url.startswith(('http://', 'https://')):
-        try:
-            parsed = urlparse(url)
-            # Return just the domain without port if present
-            domain = parsed.netloc
-            if ':' in domain:
-                domain = domain.split(':')[0]
-            logger.debug(f"Extracted domain '{domain}' from URL '{original_url}'")
-            return domain
-        except Exception as e:
-            logger.error(f"Error parsing URL '{original_url}': {e}")
-            return ""
-
-    # Handle cases like "nc3.lu/" with no protocol but with a path
-    if '/' in url:
-        domain = url.split('/', 1)[0]
-        logger.debug(f"Extracted domain '{domain}' from URL-like string '{original_url}'")
-        return domain
-
-    logger.debug(f"URL '{url}' does not have a protocol prefix or path, treating as domain")
-    return url
+    if url.startswith(tuple(ALLOWED_SCHEME)):
+        parsed_url = urlparse(url)
+        hostname = parsed_url.hostname
+        logger.debug(f"Extracted domain '{hostname}' from URL '{original_url}'")
+        return hostname
+    elif "/" in url:
+        netloc = url.split("/", 1)[0]
+        if ":" in netloc:
+            hostname = netloc.split(":")[0]
+        else:
+            hostname = netloc
+        logger.debug(
+            f"Extracted domain '{hostname}' from URL-like string '{original_url}'"
+        )
+        return hostname
+    elif validators.domain(url):
+        logger.debug(f"The provided URL '{url}' is a domain name !")
+        return url
+    return ""
 
 
-def safe_url_utils(domain: str, path: str = "", protocol: str = "https") -> Optional[str]:
+def safe_url_utils(
+    domain: str, path: str = "", protocol: str = "https"
+) -> Optional[str]:
     """
     Safely constructs a URL from domain and path components after validating inputs.
 
@@ -95,36 +91,19 @@ def safe_url_utils(domain: str, path: str = "", protocol: str = "https") -> Opti
     Returns:
         Optional[str]: A properly constructed URL or None if validation fails
     """
-    original_domain = domain
-
-    # Extract just the domain if a full URL was provided
-    domain = extract_domain_from_url(domain)
-
-    # Handle edge cases where the domain might still have trailing characters
-    domain = domain.strip()
-
-    # Validate protocol
-    if protocol not in ALLOWED_PROTOCOLS:
+    if protocol not in ALLOWED_SCHEME:
         logger.error(f"Invalid protocol: {protocol}")
         return None
 
-    # Validate domain using the validator
-    try:
-        validated_domain = validators.full_domain_validator(domain)
-        logger.debug(f"Domain '{domain}' validated successfully")
-    except Exception as e:
-        logger.error(f"Domain validation failed for '{domain}' (original input: '{original_domain}'): {e}")
+    hostname = extract_domain_from_url(domain)
+    if not hostname:
+        logger.error(f"Fail to validate '{domain}' as a domain name")
         return None
 
-    # Ensure path starts with / if it's not empty
-    if path and not path.startswith('/'):
-        path = f"/{path}"
+    url = urljoin(f"{protocol}://{hostname}", path)
+    logger.debug(f"Constructed URL: {url} from domain: {hostname}")
+    return url
 
-    # Construct URL using urlunparse to safely handle components
-    url_components = (protocol, validated_domain, path, '', '', '')
-    final_url = urlunparse(url_components)
-    logger.debug(f"Constructed URL: {final_url} from domain: {validated_domain}")
-    return final_url
 
 def check_csp(domain):
     """
@@ -140,65 +119,59 @@ def check_csp(domain):
     url = safe_url_utils(domain)
     if not url:
         return {
-            'status': False,
-            'csp_value': None,
-            'csp_report_only': None,
-            'issues': ["Invalid domain provided"],
-            'recommendations': ["Provide a valid domain name"]
+            "status": False,
+            "csp_value": None,
+            "csp_report_only": None,
+            "issues": ["Invalid domain provided"],
+            "recommendations": ["Provide a valid domain name"],
         }
 
     try:
         response = requests.get(url, timeout=10)
         response.raise_for_status()
 
-        csp_header = response.headers.get('Content-Security-Policy')
-        csp_report_only = response.headers.get('Content-Security-Policy-Report-Only')
+        csp_header = response.headers.get("Content-Security-Policy")
+        csp_report_only = response.headers.get("Content-Security-Policy-Report-Only")
 
         result = {
-            'status': False,
-            'csp_value': csp_header,
-            'csp_report_only': csp_report_only,
-            'issues': [],
-            'recommendations': []
+            "status": False,
+            "csp_value": csp_header,
+            "csp_report_only": csp_report_only,
+            "issues": [],
+            "recommendations": [],
         }
 
         if not csp_header and not csp_report_only:
-            result['issues'].append("No Content-Security-Policy header found.")
-            result['recommendations'].append(
-                "Implement a Content-Security-Policy header.")
+            result["issues"].append("No Content-Security-Policy header found.")
+            result["recommendations"].append(
+                "Implement a Content-Security-Policy header."
+            )
             return result
 
         headers_to_check = [
-            ('Content-Security-Policy', csp_header),
-            ('Content-Security-Policy-Report-Only', csp_report_only)
+            ("Content-Security-Policy", csp_header),
+            ("Content-Security-Policy-Report-Only", csp_report_only),
         ]
 
         for header_name, header_value in headers_to_check:
             if header_value:
                 analyze_csp(header_value, result, header_name)
 
-        result['status'] = len(result['issues']) == 0
+        result["status"] = len(result["issues"]) == 0
         return result
 
     except requests.RequestException as e:
         return {
-            'status': False,
-            'csp_value': None,
-            'csp_report_only': None,
-            'issues': [f"An error occurred while fetching the page: {e}"],
-            'recommendations': ["Ensure the domain is accessible and try again."]
+            "status": False,
+            "csp_value": None,
+            "csp_report_only": None,
+            "issues": [f"An error occurred while fetching the page: {e}"],
+            "recommendations": ["Ensure the domain is accessible and try again."],
         }
+
 
 def check_soa_record(target: str) -> Union[bool, Dict]:
     """Checks the presence of a SOA record for the Email Systems Testing."""
-    if not target:
-        return {"error": "No domain provided"}
-
-    try:
-        validators.full_domain_validator(target)
-    except Exception as e:
-        return {"error": f"Invalid domain format: {str(e)}"}
-
     try:
         answers = dns.resolver.resolve(target, "SOA")
         return 0 != len(answers)
@@ -216,23 +189,22 @@ def email_check(target: str) -> Dict[str, Any]:
     """Parses and validates MX, SPF, and DMARC records,
     Checks for DNSSEC deployment, Checks for STARTTLS and TLS support.
     Checks for the validity of the DKIM public key."""
-    # Validate the domain before proceeding with any operations
-    try:
-        validated_domain = validators.full_domain_validator(target)
-    except Exception:
+    if not validators.domain(target):
         return {"error": "You entered an invalid hostname!"}
 
     result = {}
     env = os.environ.copy()
     cmd = [
         os.path.join(sys.exec_prefix, "bin/checkdmarc"),
-        validated_domain,
+        target,
         "-f",
         "JSON",
     ]
     try:
         (stdout, stderr) = (
-            subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+            subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env
+            )
         ).communicate()
 
         try:
@@ -256,10 +228,10 @@ def email_check(target: str) -> Dict[str, Any]:
 
 def file_check(file_in_memory: BytesIO, file_to_check_name: str) -> Dict[str, Any]:
     """Checks a file by submitting it to a Pandora instance."""
-    try:
-        validators.file_size(file_in_memory)
-    except Exception as e:
-        raise e
+    if sys.getsizeof(file_in_memory) > MAX_UPLOAD_FILE_SIZE:
+        raise Exception(
+            f"The file size can not be more than {MAX_UPLOAD_FILE_SIZE} bytes."
+        )
 
     pandora_cli = pypandora.PyPandora(root_url=PANDORA_ROOT_URL)
     analysis_result: Dict[str, Any] = {}
@@ -272,7 +244,12 @@ def file_check(file_in_memory: BytesIO, file_to_check_name: str) -> Dict[str, An
         # Check if result is valid
         if not result or not isinstance(result, dict):
             logger.warning(f"Invalid response format from Pandora: {result}")
-            return {"result": {"error": "Invalid response from Pandora API", "details": str(result)}}
+            return {
+                "result": {
+                    "error": "Invalid response from Pandora API",
+                    "details": str(result),
+                }
+            }
 
         if not result.get("success"):
             # Unsuccessful submission of the file
@@ -283,7 +260,12 @@ def file_check(file_in_memory: BytesIO, file_to_check_name: str) -> Dict[str, An
         # Ensure taskId exists in the response
         if "taskId" not in result:
             logger.warning(f"Missing 'taskId' in Pandora submit response: {result}")
-            return {"result": {"error": "Invalid response from Pandora API", "details": "No task ID received"}}
+            return {
+                "result": {
+                    "error": "Invalid response from Pandora API",
+                    "details": "No task ID received",
+                }
+            }
 
         # Save task ID, seed, and link for all future API calls
         task_id = result["taskId"]
@@ -291,7 +273,9 @@ def file_check(file_in_memory: BytesIO, file_to_check_name: str) -> Dict[str, An
         report_link = result.get("link", "")
 
         if not seed:
-            logger.warning("No seed received from Pandora API, status checks may fail due to authentication issues")
+            logger.warning(
+                "No seed received from Pandora API, status checks may fail due to authentication issues"
+            )
 
         time.sleep(0.1)
 
@@ -300,10 +284,19 @@ def file_check(file_in_memory: BytesIO, file_to_check_name: str) -> Dict[str, An
             initial_status = pandora_cli.task_status(task_id, seed=seed)
 
             # Check for API errors
-            if isinstance(initial_status, dict) and initial_status.get("success") is False:
+            if (
+                isinstance(initial_status, dict)
+                and initial_status.get("success") is False
+            ):
                 error_msg = str(initial_status.get("error", "Unknown error"))
                 logger.warning(f"Error from Pandora API: {error_msg}")
-                return {"result": {"error": "API error", "details": error_msg, "link": report_link}}
+                return {
+                    "result": {
+                        "error": "API error",
+                        "details": error_msg,
+                        "link": report_link,
+                    }
+                }
 
             if isinstance(initial_status, dict):
                 analysis_result = initial_status
@@ -320,7 +313,9 @@ def file_check(file_in_memory: BytesIO, file_to_check_name: str) -> Dict[str, An
 
                 # Validate response
                 if not status_response or not isinstance(status_response, dict):
-                    logger.warning(f"Invalid response from Pandora task_status: {status_response}")
+                    logger.warning(
+                        f"Invalid response from Pandora task_status: {status_response}"
+                    )
                     break
 
                 # Check for API errors
@@ -335,9 +330,13 @@ def file_check(file_in_memory: BytesIO, file_to_check_name: str) -> Dict[str, An
 
                 # Check if status field exists
                 if "status" not in analysis_result:
-                    logger.warning(f"Missing 'status' key in Pandora response: {analysis_result}")
+                    logger.warning(
+                        f"Missing 'status' key in Pandora response: {analysis_result}"
+                    )
                     if "error" not in analysis_result:
-                        analysis_result["error"] = "Unknown error: Missing status field in response"
+                        analysis_result["error"] = (
+                            "Unknown error: Missing status field in response"
+                        )
                     break
 
                 # Check if processing is complete
@@ -376,19 +375,16 @@ def ipv6_check(
     Returns:
         dict: IPv6 check results or error message.
     """
-    # Validate the domain before proceeding with any operations
-    try:
-        validated_domain = validators.full_domain_validator(domain)
-    except Exception:
+    if not validators.domain(domain):
         return {"error": "You entered an invalid hostname!"}
 
-    logger.info(f"ipv6 scan: scanning domain {validated_domain}")
+    logger.info(f"ipv6 scan: scanning domain {domain}")
     results = {}
 
     # Check Name Servers connectivity:
     default_resolver = dns.resolver.Resolver().nameservers[0]
     logger.info(f"ipv6 scan: default resolver is {default_resolver}")
-    q = dns.message.make_query(validated_domain, dns.rdatatype.NS)
+    q = dns.message.make_query(domain, dns.rdatatype.NS)
     ns_response = dns.query.udp(q, default_resolver)
     ns_names = [
         t.target.to_text()
@@ -518,13 +514,13 @@ def ipv6_check(
 
     # Check website connectivity (available ips and reachability)
     try:
-        resolved_v4 = socket.getaddrinfo(validated_domain, port, socket.AF_INET)
+        resolved_v4 = socket.getaddrinfo(domain, port, socket.AF_INET)
         records_v4 = [hit[4][0] for hit in resolved_v4]
         records_v4 = list(set(records_v4))
     except socket.gaierror:
         records_v4 = [""]
     try:
-        resolved_v6 = socket.getaddrinfo(validated_domain, port, socket.AF_INET6)
+        resolved_v6 = socket.getaddrinfo(domain, port, socket.AF_INET6)
         records_v6 = [hit[4][0] for hit in resolved_v6]
         records_v6 = list(set(records_v6))
     except socket.gaierror:
@@ -535,7 +531,7 @@ def ipv6_check(
     records_v4.extend([""] * (max_len - len(records_v4)))
     records_v6.extend([""] * (max_len - len(records_v6)))
 
-    records = [(validated_domain, records_v4[i], records_v6[i]) for i in range(max_len)]
+    records = [(domain, records_v4[i], records_v6[i]) for i in range(max_len)]
 
     response = False
     records_v4_comments = None
@@ -598,17 +594,16 @@ def web_server_check(domain: str):
     Returns:
         dict: Security scan results or error message.
     """
-    # Validate the domain before proceeding with any operations
-    try:
-        validated_domain = validators.full_domain_validator(domain)
-    except Exception:
+    if not validators.domain(domain):
         return {"error": "You entered an invalid hostname!"}
 
-    logger.info(f"server scan: testing {validated_domain}")
+    logger.info(f"server scan: testing {domain}")
     nmap = nmap3.Nmap()
 
     try:
-        service_scans = nmap.nmap_version_detection(validated_domain, args="--script vulners --script-args mincvss+5.0")
+        service_scans = nmap.nmap_version_detection(
+            domain, args="--script vulners --script-args mincvss+5.0"
+        )
     except Exception as e:
         logger.error(f"Error during Nmap scan: {e}")
         return {"error": "Nmap scan failed"}
@@ -625,24 +620,30 @@ def web_server_check(domain: str):
         if port["state"] != "closed":
             service = port.get("service", {})
             vulners = port.get("scripts", [])
-            vuln_dict = {'cve': [], 'others': []}
+            vuln_dict = {"cve": [], "others": []}
             if vulners:
                 vulners = vulners[0].get("data", {})
                 for vuln, vulndata in vulners.items():
                     try:
                         items = vulndata.get("children", [])
                         for vulnerability in items:
-                            vulnerability['severity'] = cvss_rating(vulnerability['cvss'])
+                            vulnerability["severity"] = cvss_rating(
+                                vulnerability["cvss"]
+                            )
                             if vulnerability["type"] == "cve":
-                                vuln_info = lookup_cve(vulnerability['id'])
-                                vulnerability["description"] = vuln_info['description']
-                                vulnerability['cvss_details'] = vuln_info['cvss']
-                                vulnerability['sightings'] = vuln_info['sightings']
-                                vulnerability["link"] = f"https://vulnerability.circl.lu/vuln/{vulnerability['id']}"
-                                vuln_dict['cve'].append(vulnerability)
+                                vuln_info = lookup_cve(vulnerability["id"])
+                                vulnerability["description"] = vuln_info["description"]
+                                vulnerability["cvss_details"] = vuln_info["cvss"]
+                                vulnerability["sightings"] = vuln_info["sightings"]
+                                vulnerability["link"] = (
+                                    f"https://vulnerability.circl.lu/vuln/{vulnerability['id']}"
+                                )
+                                vuln_dict["cve"].append(vulnerability)
                             else:
-                                vulnerability["link"] = f"https://vulners.com/{vulnerability['type']}/{vulnerability['id']}"
-                                vuln_dict['others'].append(vulnerability)
+                                vulnerability["link"] = (
+                                    f"https://vulners.com/{vulnerability['type']}/{vulnerability['id']}"
+                                )
+                                vuln_dict["others"].append(vulnerability)
                     except TypeError:
                         continue
                     except AttributeError:
@@ -652,10 +653,12 @@ def web_server_check(domain: str):
 
             services.append(service)
             try:
-                vulnerabilities.append({
-                    "service": f'{service.get("product", "Unknown")} - {service.get("name", "Unknown")}',
-                    "vuln_dict": vuln_dict,
-                })
+                vulnerabilities.append(
+                    {
+                        "service": f'{service.get("product", "Unknown")} - {service.get("name", "Unknown")}',
+                        "vuln_dict": vuln_dict,
+                    }
+                )
             except KeyError:
                 continue
 
@@ -676,72 +679,73 @@ def cvss_rating(cvss_score):
 
 
 def lookup_cve(vuln_id):
-    vuln_lookup = PyVulnerabilityLookup('https://vulnerability.circl.lu')
+    vuln_lookup = PyVulnerabilityLookup("https://vulnerability.circl.lu")
     if vuln_lookup.is_up:
         try:
             cve = vuln_lookup.get_vulnerability(vuln_id)
         except requests.exceptions.ConnectionError:
             cve = {}
         try:
-            sightings = vuln_lookup.get_sightings(vuln_id=vuln_id, date_from=(datetime.now() - relativedelta(months=1)).date())
+            sightings = vuln_lookup.get_sightings(
+                vuln_id=vuln_id,
+                date_from=(datetime.now() - relativedelta(months=1)).date(),
+            )
         except requests.exceptions.ConnectionError:
             sightings = {}
 
-        containers = cve.get('containers', {})
-        cna = containers.get('cna', {})
-        adp = containers.get('adp', [{}])
+        containers = cve.get("containers", {})
+        cna = containers.get("cna", {})
+        adp = containers.get("adp", [{}])
         cve_info = {}
 
         # Description
-        descriptions = cna.get('descriptions', [])
+        descriptions = cna.get("descriptions", [])
         for description in descriptions:
-            if description.get('lang') == 'en':
-                cve_info['description'] = description.get('value', 'N/A')
+            if description.get("lang") == "en":
+                cve_info["description"] = description.get("value", "N/A")
                 break
             else:
-                cve_info['description'] = 'N/A'
+                cve_info["description"] = "N/A"
 
         # Severity
-        metrics = cna.get('metrics', [])
+        metrics = cna.get("metrics", [])
         if not metrics:
             for item in adp:
-                if 'metrics' in item:
-                    metrics = item['metrics']
+                if "metrics" in item:
+                    metrics = item["metrics"]
                     break
 
         if metrics:
             for metric in metrics:
-                if 'cvssV3_1' in metric or 'cvssV4_0' in metric:
-                    cvss_data = metric.get('cvssV3_1', {}) or metric.get('cvssV4_0', {})
-                    cve_info['cvss'] = cvss_data
+                if "cvssV3_1" in metric or "cvssV4_0" in metric:
+                    cvss_data = metric.get("cvssV3_1", {}) or metric.get("cvssV4_0", {})
+                    cve_info["cvss"] = cvss_data
                     break
         else:
-            cve_info['cvss'] = {}
+            cve_info["cvss"] = {}
 
         if sightings:
             dates = [
-                datetime.fromisoformat(
-                    sighting['creation_timestamp']).date()
-                for sighting in sightings['data']
+                datetime.fromisoformat(sighting["creation_timestamp"]).date()
+                for sighting in sightings["data"]
             ]
             date_counts = dict(Counter(dates))
-            sightings['dates'] = [str(date) for date in date_counts.keys()]
-            sightings['counts'] = list(date_counts.values())
+            sightings["dates"] = [str(date) for date in date_counts.keys()]
+            sightings["counts"] = list(date_counts.values())
 
-        cve_info['sightings'] = {
-            'total': sightings.get('metadata', {}).get('count', 0),
-            'dates': sightings.get('dates', []),
-            'counts': sightings.get('counts', [])
+        cve_info["sightings"] = {
+            "total": sightings.get("metadata", {}).get("count", 0),
+            "dates": sightings.get("dates", []),
+            "counts": sightings.get("counts", []),
         }
 
         return cve_info
 
 
 def web_server_check_no_raw_socket(hostname):
-    try:
-        validators.full_domain_validator(hostname)
-    except Exception:
+    if not validators.domain(hostname):
         return {"error": "You entered an invalid hostname!"}
+
     api_endpoint = "https://vulners.com/api/v3/burp/software/"
     header = {
         "User-Agent": "Vulners NMAP Plugin 1.7",
@@ -777,9 +781,13 @@ def web_server_check_no_raw_socket(hostname):
                                 "type": search_result["_source"]["type"],
                             }
                             if info["type"] == "cve":
-                                info["link"] = f"https://cvepremium.circl.lu/cve/{info['id']}"
+                                info["link"] = (
+                                    f"https://cvepremium.circl.lu/cve/{info['id']}"
+                                )
                             else:
-                                info["link"] = f"https://vulners.com/{info['type']}/{info['id']}"
+                                info["link"] = (
+                                    f"https://vulners.com/{info['type']}/{info['id']}"
+                                )
                             vuln_list.append(info)
             try:
                 service_name = (
@@ -802,10 +810,7 @@ def tls_version_check(domain: str, service):
     Returns:
         dict: TLS version check results or error message.
     """
-    # Validate the domain before proceeding with any operations
-    try:
-        validated_domain = validators.full_domain_validator(domain)
-    except Exception:
+    if not validators.domain(domain):
         return {"error": "You entered an invalid hostname!"}
 
     # Validate service
@@ -813,8 +818,8 @@ def tls_version_check(domain: str, service):
         return {"error": "Invalid service type. Must be 'web' or 'mail'."}
 
     nmap = nmap3.Nmap()
-    logger.info(f"tls scan: Scanning host/domain {validated_domain}")
-    tls_scans = nmap.nmap_version_detection(validated_domain, args="--script ssl-enum-ciphers")
+    logger.info(f"tls scan: Scanning host/domain {domain}")
+    tls_scans = nmap.nmap_version_detection(domain, args="--script ssl-enum-ciphers")
 
     try:
         ip, tls_scans = list(tls_scans.items())[0]
@@ -893,27 +898,24 @@ def check_dkim(domain: str, selector: str = None, selectors: list = None):
         dict or tuple: Either a dict with DKIM status or a tuple with (record_text, is_valid)
                       depending on how the function is called
     """
-    # Validate domain
-    try:
-        validated_domain = validators.full_domain_validator(domain)
-    except Exception:
+    if not validators.domain(domain):
         return None, False
 
     # Handle case where a single selector is provided
     if selector and not selectors:
         # Validate selector (allow only alphanumeric, hyphen, underscore)
-        if not re.match(r'^[a-zA-Z0-9_-]+$', selector):
+        if not re.match(r"^[a-zA-Z0-9_-]+$", selector):
             return None, False
 
-        dkim_domain = f'{selector}._domainkey.{validated_domain}'
+        dkim_domain = f"{selector}._domainkey.{domain}"
 
         try:
-            dkim_record = dns.resolver.resolve(dkim_domain, 'TXT')
+            dkim_record = dns.resolver.resolve(dkim_domain, "TXT")
             for record in dkim_record:
                 return record.to_text(), True
             return None, False
         except Exception as e:
-            logger.error(f'Error checking DKIM for {dkim_domain}: {e}')
+            logger.error(f"Error checking DKIM for {dkim_domain}: {e}")
             return None, False
 
     # Handle case where multiple selectors are provided or none (use defaults)
@@ -931,16 +933,14 @@ def check_dkim(domain: str, selector: str = None, selectors: list = None):
 
     for s in selectors:
         # Validate the selector to avoid injection
-        if not s or not re.match(r'^[a-zA-Z0-9_-]+$', s):
+        if not s or not re.match(r"^[a-zA-Z0-9_-]+$", s):
             logger.warning(f"Invalid selector format: {s}")
             continue
 
         try:
-            dns_query = f"{s}._domainkey.{validated_domain}."
+            dns_query = f"{s}._domainkey.{domain}."
             dns_response = (
-                dns.resolver.resolve(dns_query, "TXT")
-                .response.answer[1]
-                .to_text()
+                dns.resolver.resolve(dns_query, "TXT").response.answer[1].to_text()
             )
             p_match = re.search(r"p=([\w\d/+]*)", dns_response)
             if not p_match:
@@ -973,54 +973,6 @@ def get_pdf_report():
     return htmldoc.write_pdf(stylesheets=stylesheets)
 
 
-def check_dnssec(domain):
-    """
-    Check if DNSSEC is enabled for the domain.
-
-    Args:
-        domain (str): The domain to check.
-
-    Returns:
-        dict: A dictionary containing DNSSEC status and details.
-    """
-    # Validate the domain before proceeding with any operations
-    if not domain:
-        return {
-            "enabled": False,
-            "keys": [],
-            "error": "No domain provided"
-        }
-
-    try:
-        validated_domain = validators.full_domain_validator(domain)
-    except Exception as e:
-        return {
-            "enabled": False,
-            "keys": [],
-            "error": f"Invalid domain: {str(e)}"
-        }
-
-    result = {"enabled": False, "keys": [], "error": None}
-    try:
-        dnskey = dns.resolver.resolve(validated_domain, 'DNSKEY')
-        result["enabled"] = True
-        result["keys"] = [key.to_text() for key in dnskey]
-    except dns.resolver.NXDOMAIN:
-        result["error"] = "Domain does not exist"
-    except dns.resolver.NoAnswer:
-        result["error"] = "No DNSKEY records found"
-    except dns.exception.DNSException as e:
-        result["error"] = f"DNS error: {str(e)}"
-    except Exception as e:
-        result["error"] = f"Unexpected error: {str(e)}"
-
-    logger.info(f"DNSSEC check for {validated_domain}: {'Enabled' if result['enabled'] else 'Disabled'}")
-    if result["error"]:
-        logger.warning(f"DNSSEC check error for {validated_domain}: {result['error']}")
-
-    return result
-
-
 def check_mx(domain):
     """
     Check MX records for the domain.
@@ -1031,19 +983,16 @@ def check_mx(domain):
     Returns:
         dict: A dictionary containing MX records and details.
     """
-    # Validate the domain before proceeding with any operations
-    try:
-        validated_domain = validators.full_domain_validator(domain)
-    except Exception:
-        return {
-            "records": [],
-            "error": "Invalid domain provided"
-        }
+    if not validators.domain(domain):
+        return {"records": [], "error": "Invalid domain provided"}
 
     result = {"records": [], "error": None}
     try:
-        mx_records = dns.resolver.resolve(validated_domain, 'MX')
-        result["records"] = [{"preference": mx.preference, "exchange": str(mx.exchange)} for mx in mx_records]
+        mx_records = dns.resolver.resolve(domain, "MX")
+        result["records"] = [
+            {"preference": mx.preference, "exchange": str(mx.exchange)}
+            for mx in mx_records
+        ]
     except dns.resolver.NXDOMAIN:
         result["error"] = "Domain does not exist"
     except dns.resolver.NoAnswer:
@@ -1053,9 +1002,9 @@ def check_mx(domain):
     except Exception as e:
         result["error"] = f"Unexpected error: {str(e)}"
 
-    logger.info(f"MX check for {validated_domain}: {len(result['records'])} records found")
+    logger.info(f"MX check for {domain}: {len(result['records'])} records found")
     if result["error"]:
-        logger.warning(f"MX check error for {validated_domain}: {result['error']}")
+        logger.warning(f"MX check error for {domain}: {result['error']}")
 
     return result
 
@@ -1070,28 +1019,14 @@ def check_spf(domain):
     Returns:
         dict: A dictionary containing SPF record details.
     """
-    # Validate the domain before proceeding with any operations
-    if not domain:
-        return {
-            "record": None,
-            "valid": False,
-            "error": "No domain provided"
-        }
-
-    try:
-        validated_domain = validators.full_domain_validator(domain)
-    except Exception as e:
-        return {
-            "record": None,
-            "valid": False,
-            "error": f"Invalid domain: {str(e)}"
-        }
+    if not validators.domain(domain):
+        return {"record": None, "valid": False, "error": "Invalid domain"}
 
     result = {"record": None, "valid": False, "error": None}
     try:
-        txt_records = dns.resolver.resolve(validated_domain, 'TXT')
+        txt_records = dns.resolver.resolve(domain, "TXT")
         for record in txt_records:
-            if 'v=spf1' in str(record):
+            if "v=spf1" in str(record):
                 result["record"] = record.to_text()
                 result["valid"] = True
                 break
@@ -1104,9 +1039,11 @@ def check_spf(domain):
     except Exception as e:
         result["error"] = f"Unexpected error: {str(e)}"
 
-    logger.info(f"SPF check for {validated_domain}: {'Valid' if result['valid'] else 'Not found or invalid'}")
+    logger.info(
+        f"SPF check for {domain}: {'Valid' if result['valid'] else 'Not found or invalid'}"
+    )
     if result["error"]:
-        logger.warning(f"SPF check error for {validated_domain}: {result['error']}")
+        logger.warning(f"SPF check error for {domain}: {result['error']}")
 
     return result
 
@@ -1121,51 +1058,39 @@ def check_dmarc(domain: str) -> dict[str, bool | None | str | Any]:
     Returns:
         dict: A dictionary containing DMARC record details.
     """
-    # Validate the domain before proceeding with any operations
-    if not domain:
-        return {
-            "record": None,
-            "valid": False,
-            "error": "No domain provided"
-        }
-
-    try:
-        validated_domain = validators.full_domain_validator(domain)
-    except Exception as e:
-        return {
-            "record": None,
-            "valid": False,
-            "error": f"Invalid domain: {str(e)}"
-        }
+    if not validators.domain(domain):
+        return {"record": None, "valid": False, "error": "Invalid domain"}
 
     result = {"record": None, "valid": False, "error": None}
-    dmarc_domain = f'_dmarc.{validated_domain}'
+    dmarc_domain = f"_dmarc.{domain}"
 
     try:
-        dmarc_records = dns.resolver.resolve(dmarc_domain, 'TXT')
+        dmarc_records = dns.resolver.resolve(dmarc_domain, "TXT")
 
         for record in dmarc_records:
             record_text = record.to_text().strip('"')
-            if record_text.startswith('v=DMARC1'):
-                result['record'] = record_text
-                result['valid'] = True
+            if record_text.startswith("v=DMARC1"):
+                result["record"] = record_text
+                result["valid"] = True
                 break
 
-        if not result['valid']:
-            result['error'] = "No valid DMARC record found"
+        if not result["valid"]:
+            result["error"] = "No valid DMARC record found"
 
     except dns.resolver.NXDOMAIN:
-        result['error'] = "Domain does not exist"
+        result["error"] = "Domain does not exist"
     except dns.resolver.NoAnswer:
-        result['error'] = "No TXT records found"
+        result["error"] = "No TXT records found"
     except dns.exception.DNSException as e:
-        result['error'] = f"DNS error: {str(e)}"
+        result["error"] = f"DNS error: {str(e)}"
     except Exception as e:
-        result['error'] = f"Unexpected error: {str(e)}"
+        result["error"] = f"Unexpected error: {str(e)}"
 
-    logger.info(f"DMARC check for {validated_domain}: {'Valid' if result['valid'] else 'Not found or invalid'}")
-    if result['error']:
-        logger.warning(f"DMARC check error for {validated_domain}: {result['error']}")
+    logger.info(
+        f"DMARC check for {domain}: {'Valid' if result['valid'] else 'Not found or invalid'}"
+    )
+    if result["error"]:
+        logger.warning(f"DMARC check error for {domain}: {result['error']}")
 
     return result
 
@@ -1191,11 +1116,9 @@ def check_tls(mx_servers: List[str]) -> Dict[str, Dict[str, str]]:
                                and the inner dictionary contains port numbers as keys and
                                TLS support status or error messages as values.
     """
+
     def check_server(server: str) -> Tuple[str, Dict[str, str]]:
-        # Validate the server hostname
-        try:
-            validated_server = validators.full_domain_validator(server)
-        except Exception:
+        if not validators.domain(server):
             return server, {f"{server}:0": "Invalid server hostname"}
 
         results = {}
@@ -1206,29 +1129,31 @@ def check_tls(mx_servers: List[str]) -> Dict[str, Dict[str, str]]:
                 context.check_hostname = True
                 context.verify_mode = ssl.CERT_REQUIRED
 
-                with socket.create_connection((validated_server, port), timeout=5) as sock:
+                with socket.create_connection((server, port), timeout=5) as sock:
                     if port in (25, 587):
                         # For these ports, try STARTTLS
-                        with smtp.SMTP(host=validated_server, port=port, timeout=5) as smtp_conn:
+                        with smtp.SMTP(host=server, port=port, timeout=5) as smtp_conn:
                             smtp_conn.ehlo()
-                            if smtp_conn.has_extn('STARTTLS'):
+                            if smtp_conn.has_extn("STARTTLS"):
                                 smtp_conn.starttls(context=context)
                                 smtp_conn.ehlo()
-                                results[f"{validated_server}:{port}"] = "TLS supported (STARTTLS)"
+                                results[f"{server}:{port}"] = "TLS supported (STARTTLS)"
                             else:
-                                results[f"{validated_server}:{port}"] = "TLS not supported"
+                                results[f"{server}:{port}"] = "TLS not supported"
                     elif port == 465:
                         # For 465, it should be SSL/TLS from the start
-                        with context.wrap_socket(sock, server_hostname=validated_server) as ssock:
+                        with context.wrap_socket(sock, server_hostname=server) as ssock:
                             cert = ssock.getpeercert()
-                            ssl.match_hostname(cert, validated_server)
-                            results[f"{validated_server}:{port}"] = "TLS supported"
+                            ssl.match_hostname(cert, server)
+                            results[f"{server}:{port}"] = "TLS supported"
             except ssl.SSLCertVerificationError:
-                results[f"{validated_server}:{port}"] = "TLS supported, but certificate verification failed"
+                results[f"{server}:{port}"] = (
+                    "TLS supported, but certificate verification failed"
+                )
             except Exception as e:
-                results[f"{validated_server}:{port}"] = f"Error: {str(e)}"
-                logging.exception(f"Error checking {validated_server}:{port}")
-        return validated_server, results
+                results[f"{server}:{port}"] = f"Error: {str(e)}"
+                logging.exception(f"Error checking {server}:{port}")
+        return server, results
 
     # Validate the list of servers
     if not mx_servers or not isinstance(mx_servers, list):
@@ -1245,7 +1170,10 @@ def check_tls(mx_servers: List[str]) -> Dict[str, Dict[str, str]]:
 
     tls_results = {}
     with ThreadPoolExecutor(max_workers=min(len(validated_servers), 10)) as executor:
-        future_to_server = {executor.submit(check_server, server): server for server in validated_servers}
+        future_to_server = {
+            executor.submit(check_server, server): server
+            for server in validated_servers
+        }
         for future in as_completed(future_to_server):
             server, result = future.result()
             tls_results[server] = result
@@ -1264,7 +1192,7 @@ def analyze_csp(csp, result, header_name):
 
 def parse_csp(csp):
     directives = {}
-    for directive in csp.split(';'):
+    for directive in csp.split(";"):
         directive = directive.strip()
         if not directive:
             continue
@@ -1277,49 +1205,62 @@ def parse_csp(csp):
 
 
 def check_unsafe_directives(directives, result, header_name):
-    unsafe_directives = ['unsafe-inline', 'unsafe-eval', 'unsafe-hashes']
+    unsafe_directives = ["unsafe-inline", "unsafe-eval", "unsafe-hashes"]
     for directive, value in directives.items():
         for unsafe in unsafe_directives:
             if unsafe in value:
-                result['issues'].append(
-                    f"{header_name}: Unsafe directive '{unsafe}' found in '{directive}'.")
-                result['recommendations'].append(
-                    f"Remove '{unsafe}' from the '{directive}' directive if possible.")
+                result["issues"].append(
+                    f"{header_name}: Unsafe directive '{unsafe}' found in '{directive}'."
+                )
+                result["recommendations"].append(
+                    f"Remove '{unsafe}' from the '{directive}' directive if possible."
+                )
 
 
 def check_missing_directives(directives, result, header_name):
-    important_directives = ['default-src', 'script-src', 'style-src', 'img-src',
-                          'connect-src']  # Removed frame-src as it's optional when default-src is set
+    important_directives = [
+        "default-src",
+        "script-src",
+        "style-src",
+        "img-src",
+        "connect-src",
+    ]  # Removed frame-src as it's optional when default-src is set
     for directive in important_directives:
-        if directive not in directives and 'default-src' not in directives:
-            result['issues'].append(
-                f"{header_name}: Missing important directive '{directive}'.")
-            result['recommendations'].append(
-                f"Consider adding the '{directive}' directive.")
+        if directive not in directives and "default-src" not in directives:
+            result["issues"].append(
+                f"{header_name}: Missing important directive '{directive}'."
+            )
+            result["recommendations"].append(
+                f"Consider adding the '{directive}' directive."
+            )
 
 
 def check_overly_permissive_directives(directives, result, header_name):
     for directive, value in directives.items():
         values = value.split()
         for val in values:
-            if val == '*':  # Only flag standalone wildcards
-                result['issues'].append(
-                    f"{header_name}: Overly permissive wildcard '*' found in '{directive}'.")
-                result['recommendations'].append(
-                    f"Restrict the '{directive}' directive to specific sources instead of using '*'.")
+            if val == "*":  # Only flag standalone wildcards
+                result["issues"].append(
+                    f"{header_name}: Overly permissive wildcard '*' found in '{directive}'."
+                )
+                result["recommendations"].append(
+                    f"Restrict the '{directive}' directive to specific sources instead of using '*'."
+                )
+
 
 # False positives not reliable enough
-#def check_csp_syntax(csp, result, header_name):
+# def check_csp_syntax(csp, result, header_name):
 #    if not re.match(r'^[a-zA-Z0-9\-]+\s+[^;]+(?:;\s*[a-zA-Z0-9\-]+\s+[^;]+)*$', csp):
 #        result['issues'].append(f"{header_name}: CSP syntax appears to be invalid.")
 #        result['recommendations'].append("Review and correct the CSP syntax.")
 
 
 def check_report_uri(directives, result, header_name):
-    if 'report-uri' not in directives and 'report-to' not in directives:
-        result['issues'].append(f"{header_name}: No reporting directive found.")
-        result['recommendations'].append(
-            "Consider adding a 'report-uri (deprecated)' or 'report-to' directive for CSP violation reporting.")
+    if "report-uri" not in directives and "report-to" not in directives:
+        result["issues"].append(f"{header_name}: No reporting directive found.")
+        result["recommendations"].append(
+            "Consider adding a 'report-uri (deprecated)' or 'report-to' directive for CSP violation reporting."
+        )
 
 
 def check_cookies(domain: str) -> Dict[str, Any]:
@@ -1341,11 +1282,7 @@ def check_cookies(domain: str) -> Dict[str, Any]:
     # Construct URL safely
     url = safe_url_utils(domain)
     if not url:
-        return {
-            'status': False,
-            'cookies': [],
-            'message': 'Invalid domain provided'
-        }
+        return {"status": False, "cookies": [], "message": "Invalid domain provided"}
 
     try:
         response = requests.get(url, timeout=10)
@@ -1357,28 +1294,22 @@ def check_cookies(domain: str) -> Dict[str, Any]:
 
         for cookie in cookies:
             secure = cookie.secure
-            http_only = cookie.has_nonstandard_attr('HttpOnly')
+            http_only = cookie.has_nonstandard_attr("HttpOnly")
             all_secure = all_secure and secure and http_only
-            cookie_details.append({
-                'name': cookie.name,
-                'secure': secure,
-                'http_only': http_only
-            })
+            cookie_details.append(
+                {"name": cookie.name, "secure": secure, "http_only": http_only}
+            )
 
-        message = 'Cookie security attributes check completed.'
+        message = "Cookie security attributes check completed."
         if not cookie_details:
-            message = 'No cookies found for this domain.'
+            message = "No cookies found for this domain."
 
-        return {
-            'status': all_secure,
-            'cookies': cookie_details,
-            'message': message
-        }
+        return {"status": all_secure, "cookies": cookie_details, "message": message}
     except requests.RequestException as e:
         return {
-            'status': False,
-            'cookies': [],
-            'message': f'An error occurred: {str(e)}'
+            "status": False,
+            "cookies": [],
+            "message": f"An error occurred: {str(e)}",
         }
 
 
@@ -1399,36 +1330,44 @@ def check_cors(domain):
     url = safe_url_utils(domain)
     if not url:
         return {
-            'status': False,
-            'cors_headers': {},
-            'message': 'Invalid domain provided'
+            "status": False,
+            "cors_headers": {},
+            "message": "Invalid domain provided",
         }
 
     try:
         response = requests.options(url, timeout=10)
         cors_headers = {
-            'Access-Control-Allow-Origin': response.headers.get('Access-Control-Allow-Origin'),
-            'Access-Control-Allow-Methods': response.headers.get('Access-Control-Allow-Methods'),
-            'Access-Control-Allow-Headers': response.headers.get('Access-Control-Allow-Headers'),
-            'Access-Control-Allow-Credentials': response.headers.get('Access-Control-Allow-Credentials')
+            "Access-Control-Allow-Origin": response.headers.get(
+                "Access-Control-Allow-Origin"
+            ),
+            "Access-Control-Allow-Methods": response.headers.get(
+                "Access-Control-Allow-Methods"
+            ),
+            "Access-Control-Allow-Headers": response.headers.get(
+                "Access-Control-Allow-Headers"
+            ),
+            "Access-Control-Allow-Credentials": response.headers.get(
+                "Access-Control-Allow-Credentials"
+            ),
         }
         if any(cors_headers.values()):
             return {
-                'status': True,
-                'cors_headers': cors_headers,
-                'message': 'CORS headers are present.'
+                "status": True,
+                "cors_headers": cors_headers,
+                "message": "CORS headers are present.",
             }
         else:
             return {
-                'status': False,
-                'cors_headers': cors_headers,
-                'message': 'CORS headers are not present.'
+                "status": False,
+                "cors_headers": cors_headers,
+                "message": "CORS headers are not present.",
             }
     except requests.RequestException as e:
         return {
-            'status': False,
-            'cors_headers': {},
-            'message': f'An error occurred: {e}'
+            "status": False,
+            "cors_headers": {},
+            "message": f"An error occurred: {e}",
         }
 
 
@@ -1445,55 +1384,52 @@ def check_https_redirect(domain):
               - 'redirect_url' (str): The URL to which the domain redirects or None if not applicable.
               - 'message' (str): Additional information or error message.
     """
-    # First validate the domain
-    try:
-        validated_domain = validators.full_domain_validator(domain)
-    except Exception:
+    if not validators.domain(domain):
         return {
-            'status': False,
-            'redirect_url': None,
-            'message': 'Invalid domain provided'
+            "status": False,
+            "redirect_url": None,
+            "message": "Invalid domain provided",
         }
 
     # Safely construct HTTP URL for testing redirect
-    url = safe_url_utils(validated_domain, protocol="http")
+    url = safe_url_utils(domain, protocol="http")
     if not url:
         return {
-            'status': False,
-            'redirect_url': None,
-            'message': 'Invalid domain provided'
+            "status": False,
+            "redirect_url": None,
+            "message": "Invalid domain provided",
         }
 
     try:
         http_response = requests.get(url, allow_redirects=False, timeout=10)
-        redirect_location = http_response.headers.get('Location', '')
+        redirect_location = http_response.headers.get("Location", "")
 
         # Validate the redirect location
         if http_response.is_redirect:
             # Check if it redirects to HTTPS
-            if redirect_location.startswith('https'):
+            if redirect_location.startswith("https"):
                 return {
-                    'status': True,
-                    'redirect_url': redirect_location,
-                    'message': 'HTTP to HTTPS redirection is properly configured.'
+                    "status": True,
+                    "redirect_url": redirect_location,
+                    "message": "HTTP to HTTPS redirection is properly configured.",
                 }
             else:
                 return {
-                    'status': False,
-                    'redirect_url': redirect_location,
-                    'message': 'Redirection exists but does not use HTTPS.'
+                    "status": False,
+                    "redirect_url": redirect_location,
+                    "message": "Redirection exists but does not use HTTPS.",
                 }
         else:
             return {
-                'status': False,
-                'redirect_url': redirect_location,
-                'message': 'HTTP to HTTPS redirection is not properly configured.'
+                "status": False,
+                "redirect_url": redirect_location,
+                "message": "HTTP to HTTPS redirection is not properly configured.",
             }
     except requests.RequestException as e:
         return {
-            'status': False,
-            'redirect_url': None,
-            'message': f'An error occurred: {e}'
+            "status": False,
+            "redirect_url": None,
+            "message": f"An error occurred: {e}",
         }
 
 
@@ -1514,33 +1450,33 @@ def check_referrer_policy(domain):
     url = safe_url_utils(domain)
     if not url:
         return {
-            'status': False,
-            'header_value': None,
-            'message': 'Invalid domain provided'
+            "status": False,
+            "header_value": None,
+            "message": "Invalid domain provided",
         }
 
     try:
         response = requests.get(url, timeout=10)
         response.raise_for_status()
-        referrer_policy = response.headers.get('Referrer-Policy')
+        referrer_policy = response.headers.get("Referrer-Policy")
 
         if referrer_policy:
             return {
-                'status': True,
-                'header_value': referrer_policy,
-                'message': 'Referrer-Policy header is present.'
+                "status": True,
+                "header_value": referrer_policy,
+                "message": "Referrer-Policy header is present.",
             }
         else:
             return {
-                'status': False,
-                'header_value': None,
-                'message': 'Referrer-Policy header is not present.'
+                "status": False,
+                "header_value": None,
+                "message": "Referrer-Policy header is not present.",
             }
     except requests.RequestException as e:
         return {
-            'status': False,
-            'header_value': None,
-            'message': f'An error occurred: {e}'
+            "status": False,
+            "header_value": None,
+            "message": f"An error occurred: {e}",
         }
 
 
@@ -1564,32 +1500,30 @@ def check_sri(domain):
     # Construct URL safely
     url = safe_url_utils(domain)
     if not url:
-        return {
-            'status': 'red',
-            'resources': [],
-            'message': 'Invalid domain provided'
-        }
+        return {"status": "red", "resources": [], "message": "Invalid domain provided"}
 
     try:
         response = requests.get(url, timeout=10)
         response.raise_for_status()
-        soup = BeautifulSoup(response.content, 'html.parser')
-        scripts = soup.find_all('script', src=True)
-        stylesheets = soup.find_all('link', rel='stylesheet', href=True)
+        soup = BeautifulSoup(response.content, "html.parser")
+        scripts = soup.find_all("script", src=True)
+        stylesheets = soup.find_all("link", rel="stylesheet", href=True)
         resource_details = []
         all_cross_origin_have_valid_integrity = True
         cross_origin_resources_exist = False
 
         for resource in scripts + stylesheets:
-            resource_type = 'script' if resource.name == 'script' else 'stylesheet'
-            src = urljoin(url, resource['src'] if resource_type == 'script' else resource['href'])
+            resource_type = "script" if resource.name == "script" else "stylesheet"
+            src = urljoin(
+                url, resource["src"] if resource_type == "script" else resource["href"]
+            )
 
             # Validate the constructed URL
             parsed_src = urlparse(src)
-            if not parsed_src.scheme or parsed_src.scheme not in ALLOWED_PROTOCOLS:
+            if not parsed_src.scheme or parsed_src.scheme not in ALLOWED_SCHEME:
                 continue
 
-            integrity = resource.get('integrity')
+            integrity = resource.get("integrity")
             is_cross_origin = is_cross_origin_url(url, src)
             has_integrity = bool(integrity)
             integrity_valid = None
@@ -1603,32 +1537,32 @@ def check_sri(domain):
                     if not integrity_valid:
                         all_cross_origin_have_valid_integrity = False
 
-            resource_details.append({
-                'type': resource_type,
-                'src': src,
-                'is_cross_origin': is_cross_origin,
-                'has_integrity': has_integrity,
-                'integrity_value': integrity,
-                'integrity_valid': integrity_valid if is_cross_origin else None
-            })
+            resource_details.append(
+                {
+                    "type": resource_type,
+                    "src": src,
+                    "is_cross_origin": is_cross_origin,
+                    "has_integrity": has_integrity,
+                    "integrity_value": integrity,
+                    "integrity_valid": integrity_valid if is_cross_origin else None,
+                }
+            )
 
         if not cross_origin_resources_exist:
-            status = 'neutral'
-            message = 'No cross-origin resources found. Consider implementing SRI for all resources as a best practice.'
+            status = "neutral"
+            message = "No cross-origin resources found. Consider implementing SRI for all resources as a best practice."
         elif all_cross_origin_have_valid_integrity:
-            status = 'green'
-            message = 'All cross-origin resources have valid integrity attributes.'
+            status = "green"
+            message = "All cross-origin resources have valid integrity attributes."
         else:
-            status = 'red'
-            message = 'Some cross-origin resources are missing valid integrity attributes.'
+            status = "red"
+            message = (
+                "Some cross-origin resources are missing valid integrity attributes."
+            )
 
-        return {
-            'status': status,
-            'resources': resource_details,
-            'message': message
-        }
+        return {"status": status, "resources": resource_details, "message": message}
     except requests.RequestException as e:
-        return {'status': 'red', 'resources': [], 'message': f'An error occurred: {e}'}
+        return {"status": "red", "resources": [], "message": f"An error occurred: {e}"}
 
 
 def is_cross_origin_url(base_url, url):
@@ -1644,8 +1578,10 @@ def is_cross_origin_url(base_url, url):
     """
     base_parsed = urlparse(base_url)
     url_parsed = urlparse(url)
-    return (base_parsed.scheme != url_parsed.scheme or
-            base_parsed.netloc != url_parsed.netloc)
+    return (
+        base_parsed.scheme != url_parsed.scheme
+        or base_parsed.netloc != url_parsed.netloc
+    )
 
 
 def validate_integrity(src, integrity):
@@ -1665,7 +1601,7 @@ def validate_integrity(src, integrity):
         logger.error(f"Invalid URL format: {src}")
         return False
 
-    if parsed_url.scheme not in ALLOWED_PROTOCOLS:
+    if parsed_url.scheme not in ALLOWED_SCHEME:
         logger.error(f"Disallowed protocol in URL: {src}")
         return False
 
@@ -1679,13 +1615,14 @@ def validate_integrity(src, integrity):
 
         for integrity_value in integrity_values:
             try:
-                algo, provided_hash = integrity_value.split('-', 1)
-                if algo not in ('sha256', 'sha384', 'sha512'):
+                algo, provided_hash = integrity_value.split("-", 1)
+                if algo not in ("sha256", "sha384", "sha512"):
                     continue
 
                 hash_func = getattr(hashlib, algo)
                 calculated_hash = base64.b64encode(hash_func(content).digest()).decode(
-                    'utf-8')
+                    "utf-8"
+                )
 
                 if calculated_hash == provided_hash:
                     return True
@@ -1719,23 +1656,37 @@ def check_x_content_type_options(domain):
     url = safe_url_utils(domain)
     if not url:
         return {
-            'status': False,
-            'header_value': None,
-            'message': 'Invalid domain provided'
+            "status": False,
+            "header_value": None,
+            "message": "Invalid domain provided",
         }
 
     try:
         response = requests.get(url, timeout=10)
-        header_value = response.headers.get('X-Content-Type-Options')
-        if header_value == 'nosniff':
-            return {'status': True, 'header_value': header_value, 'message': 'Header is correctly set to nosniff.'}
+        header_value = response.headers.get("X-Content-Type-Options")
+        if header_value == "nosniff":
+            return {
+                "status": True,
+                "header_value": header_value,
+                "message": "Header is correctly set to nosniff.",
+            }
         else:
-            return {'status': False, 'header_value': header_value, 'message': 'Header is not set to nosniff.'}
+            return {
+                "status": False,
+                "header_value": header_value,
+                "message": "Header is not set to nosniff.",
+            }
     except requests.RequestException as e:
-        return {'status': False, 'header_value': None, 'message': f'An error occurred: {e}'}
+        return {
+            "status": False,
+            "header_value": None,
+            "message": f"An error occurred: {e}",
+        }
 
 
-def check_hsts(domain: str) -> Dict[str, Union[bool, str, Dict[str, Union[str, bool, int]]]]:
+def check_hsts(
+    domain: str,
+) -> Dict[str, Union[bool, str, Dict[str, Union[str, bool, int]]]]:
     """
     Checks if the HTTP Strict Transport Security (HSTS) header is implemented and returns detailed information.
     Args:
@@ -1754,84 +1705,93 @@ def check_hsts(domain: str) -> Dict[str, Union[bool, str, Dict[str, Union[str, b
     url = safe_url_utils(domain)
     if not url:
         return {
-            'status': False,
-            'data': 'Invalid domain provided',
-            'parsed': {},
-            'http_status': None,
-            'preload_ready': False,
-            'strength': 'N/A',
-            'recommendations': ['Provide a valid domain name']
+            "status": False,
+            "data": "Invalid domain provided",
+            "parsed": {},
+            "http_status": None,
+            "preload_ready": False,
+            "strength": "N/A",
+            "recommendations": ["Provide a valid domain name"],
         }
 
     try:
         response = requests.get(url, timeout=10)
         response.raise_for_status()
-        hsts_header = response.headers.get('strict-transport-security')
+        hsts_header = response.headers.get("strict-transport-security")
         parsed_hsts = parse_hsts_header(hsts_header) if hsts_header else {}
 
-        preload_ready = parsed_hsts.get('preload', False)
+        preload_ready = parsed_hsts.get("preload", False)
         strength, recommendations = evaluate_hsts_strength(parsed_hsts)
 
         return {
-            'status': bool(hsts_header),
-            'data': hsts_header or 'HSTS header not found.',
-            'parsed': parsed_hsts,
-            'http_status': response.status_code,
-            'preload_ready': preload_ready,
-            'strength': strength,
-            'recommendations': recommendations
+            "status": bool(hsts_header),
+            "data": hsts_header or "HSTS header not found.",
+            "parsed": parsed_hsts,
+            "http_status": response.status_code,
+            "preload_ready": preload_ready,
+            "strength": strength,
+            "recommendations": recommendations,
         }
     except requests.RequestException as e:
         return {
-            'status': False,
-            'data': f'Failed to fetch the domain: {str(e)}',
-            'parsed': {},
-            'http_status': getattr(e.response, 'status_code', None),
-            'preload_ready': False,
-            'strength': 'N/A',
-            'recommendations': ['Ensure the domain is accessible and supports HTTPS.']
+            "status": False,
+            "data": f"Failed to fetch the domain: {str(e)}",
+            "parsed": {},
+            "http_status": getattr(e.response, "status_code", None),
+            "preload_ready": False,
+            "strength": "N/A",
+            "recommendations": ["Ensure the domain is accessible and supports HTTPS."],
         }
 
 
-def evaluate_hsts_strength(parsed_hsts: Dict[str, Union[str, bool, int]]) -> tuple[str, List[str]]:
+def evaluate_hsts_strength(
+    parsed_hsts: Dict[str, Union[str, bool, int]],
+) -> tuple[str, List[str]]:
     """Evaluate the strength of the HSTS implementation and provide recommendations."""
-    strength = 'Weak'
+    strength = "Weak"
     recommendations = []
 
     if not parsed_hsts:
-        return 'None', ['Implement HSTS header']
+        return "None", ["Implement HSTS header"]
 
-    max_age = parsed_hsts.get('max-age', 0)
+    max_age = parsed_hsts.get("max-age", 0)
     if max_age < 31536000:  # Less than 1 year
-        recommendations.append('Increase max-age to at least 1 year (31536000 seconds)')
+        recommendations.append("Increase max-age to at least 1 year (31536000 seconds)")
 
-    if not parsed_hsts.get('includeSubDomains'):
-        recommendations.append('Add includeSubDomains directive')
+    if not parsed_hsts.get("includeSubDomains"):
+        recommendations.append("Add includeSubDomains directive")
 
-    if not parsed_hsts.get('preload'):
-        recommendations.append('Add preload directive')
+    if not parsed_hsts.get("preload"):
+        recommendations.append("Add preload directive")
     else:
-        recommendations.append('Consider submitting domain to HSTS preload list: https://hstspreload.org/')
+        recommendations.append(
+            "Consider submitting domain to HSTS preload list: https://hstspreload.org/"
+        )
 
-    if max_age >= 31536000 and parsed_hsts.get('includeSubDomains') and parsed_hsts.get('preload'):
-        strength = 'Strong'
+    if (
+        max_age >= 31536000
+        and parsed_hsts.get("includeSubDomains")
+        and parsed_hsts.get("preload")
+    ):
+        strength = "Strong"
     elif max_age >= 15768000:  # 6 months
-        strength = 'Moderate'
+        strength = "Moderate"
 
     return strength, recommendations
 
+
 def parse_hsts_header(header: str) -> Dict[str, Union[str, bool, int]]:
     """Parse the HSTS header into its components."""
-    components = header.split(';')
+    components = header.split(";")
     parsed = {}
     for component in components:
         component = component.strip().lower()
-        if component.startswith('max-age='):
-            parsed['max-age'] = int(component.split('=')[1])
-        elif component == 'includesubdomains':
-            parsed['includeSubDomains'] = True
-        elif component == 'preload':
-            parsed['preload'] = True
+        if component.startswith("max-age="):
+            parsed["max-age"] = int(component.split("=")[1])
+        elif component == "includesubdomains":
+            parsed["includeSubDomains"] = True
+        elif component == "preload":
+            parsed["preload"] = True
     return parsed
 
 
@@ -1850,10 +1810,7 @@ def check_security_txt(domain: str) -> dict:
     # Construct URL safely with a specific path
     url = safe_url_utils(domain, path="/.well-known/security.txt")
     if not url:
-        return {
-            'status': False,
-            'data': 'Invalid domain provided'
-        }
+        return {"status": False, "data": "Invalid domain provided"}
 
     try:
         # First, check if the file exists using HEAD request
@@ -1863,46 +1820,61 @@ def check_security_txt(domain: str) -> dict:
             try:
                 response = requests.get(url, timeout=10)
                 response.raise_for_status()
-                return {'status': True, 'data': response.text}
+                return {"status": True, "data": response.text}
             except requests.RequestException as e:
-                return {'status': True, 'data': f'security.txt file found but cannot be read: {str(e)}'}
+                return {
+                    "status": True,
+                    "data": f"security.txt file found but cannot be read: {str(e)}",
+                }
         elif head_response.status_code in (403, 401):
-            return {'status': False, 'data': 'Access to security.txt is forbidden or unauthorized.'}
+            return {
+                "status": False,
+                "data": "Access to security.txt is forbidden or unauthorized.",
+            }
         elif head_response.status_code == 404:
-            return {'status': False, 'data': 'security.txt file not found.'}
+            return {"status": False, "data": "security.txt file not found."}
         else:
-            return {'status': False, 'data': f'Unexpected HTTP status: {head_response.status_code}'}
+            return {
+                "status": False,
+                "data": f"Unexpected HTTP status: {head_response.status_code}",
+            }
     except requests.RequestException as e:
-        return {'status': False, 'data': f'security.txt check failed: {str(e)}'}
+        return {"status": False, "data": f"security.txt check failed: {str(e)}"}
 
 
 def get_capture_result(lookyloo, capture_uuid):
     capture_results = lookyloo.get_modules_responses(capture_uuid)
-    url = lookyloo.get_info(capture_uuid)['url']
+    url = lookyloo.get_info(capture_uuid)["url"]
     if len(url) > 60:
-        url = url[:30] + ' [...] ' + url[-30:] + ' (shortened url)'
-    vt = list(capture_results['vt'].values())[0]
+        url = url[:30] + " [...] " + url[-30:] + " (shortened url)"
+    vt = list(capture_results["vt"].values())[0]
     if vt:
-        virustotal = any(value['result'] not in ('clean', 'unrated') for value in vt['attributes']['last_analysis_results'].values())
+        virustotal = any(
+            value["result"] not in ("clean", "unrated")
+            for value in vt["attributes"]["last_analysis_results"].values()
+        )
     else:
         virustotal = False
-    phishtank = any(value is not None for value in
-                    capture_results['phishtank']['urls'].values())
+    phishtank = any(
+        value is not None for value in capture_results["phishtank"]["urls"].values()
+    )
     urlhaus = any(
-        value is not None for value in capture_results['urlhaus']['urls'].values())
-    if capture_results['urlscan']['result']:
-        urlscan = capture_results['urlscan']['result']['verdicts']['overall'][
-            'malicious']
+        value is not None for value in capture_results["urlhaus"]["urls"].values()
+    )
+    if capture_results["urlscan"]["result"]:
+        urlscan = capture_results["urlscan"]["result"]["verdicts"]["overall"][
+            "malicious"
+        ]
     else:
         urlscan = False
     overall = virustotal or phishtank or urlhaus or urlscan
     return {
-        'url': url,
-        'virustotal': virustotal,
-        'phishtank': phishtank,
-        'urlhaus': urlhaus,
-        'urlscan': urlscan,
-        'overall': overall
+        "url": url,
+        "virustotal": virustotal,
+        "phishtank": phishtank,
+        "urlhaus": urlhaus,
+        "urlscan": urlscan,
+        "overall": overall,
     }
 
 

@@ -1,72 +1,72 @@
+import base64
 import datetime
 import ipaddress
+import json
+import logging
 import os
 import re
 import socket
-from time import sleep
-import logging
-import requests
-
-import weasyprint
-import matplotlib.pyplot as plt
-import base64
-from pylookyloo import Lookyloo
-
+from datetime import datetime
 from io import BytesIO
+from time import sleep
 from typing import Any, Dict
 from urllib.parse import parse_qs, urlparse
-from PIL import Image
 
-from ipwhois import IPDefinedError, IPWhois
-
+import matplotlib.pyplot as plt
+import requests
+import validators
+import weasyprint
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.core.files.base import ContentFile
-from django.http import HttpResponse
-from django.shortcuts import redirect, render
+from django.http import HttpResponse, JsonResponse
+from django.shortcuts import get_object_or_404, redirect, render
+from django.template.loader import get_template
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
-from django.template.loader import get_template
+from ipwhois import IPDefinedError, IPWhois
+from pylookyloo import Lookyloo
 
 from testing_platform import settings
 
+from .dnssec import Dnssec
 from .forms import DMARCRecordForm, SPFRecordForm
 from .helpers import (
-    check_soa_record,
-    file_check,
-    ipv6_check,
-    web_server_check,
-    check_dnssec,
-    check_spf,
-    check_dmarc,
-    check_hsts,
-    check_csp,
     check_cookies,
     check_cors,
+    check_csp,
+    check_dkim,
+    check_dmarc,
+    check_hsts,
     check_https_redirect,
     check_referrer_policy,
+    check_security_txt,
+    check_soa_record,
+    check_spf,
     check_sri,
     check_x_content_type_options,
-    check_security_txt,
+    extract_domain_from_url,
+    file_check,
     get_capture_result,
     get_recent_captures,
-    check_dkim,
-    extract_domain_from_url,
-    safe_url_utils
+    ipv6_check,
+    safe_url_utils,
+    web_server_check,
 )
-from .models import DMARCRecord, DMARCReport, MailDomain, TestReport, CSPReport, CSPEndpoint
-from . import validators
-import json
-from datetime import datetime
-from django.http import JsonResponse
-from django.shortcuts import render, get_object_or_404
-from django.contrib.auth.decorators import login_required
-from django.views.decorators.http import require_http_methods
+from .models import (
+    CSPEndpoint,
+    CSPReport,
+    DMARCRecord,
+    DMARCReport,
+    MailDomain,
+    TestReport,
+)
 
 # Get a logger for this module
 logger = logging.getLogger(__name__)
 
 BASE_URL = os.getenv("BASE_URL", "localhost:8000")
+
 
 @login_required
 def ping_test(request):
@@ -104,6 +104,7 @@ def ping_test(request):
 @login_required
 def test_landing(request):
     return render(request, "test_landing.html")
+
 
 # def zap_test(request):
 #     if request.method == "POST":
@@ -145,39 +146,71 @@ def test_landing(request):
 
 @csrf_exempt
 def check_website_security(request):
-    if request.method == 'POST':
-        domain = request.POST.get('target', '').strip()
+    if request.method == "POST":
+        domain = request.POST.get("target", "").strip()
 
         # Log the input for debugging
         logger.debug(f"Web security check requested for: {domain}")
 
         if not domain:
-            return render(request, 'check_webapp.html', {
-                'error': 'Please enter a domain to check'
-            })
+            return render(
+                request,
+                "check_webapp.html",
+                {"error": "Please enter a domain to check"},
+            )
 
         # Extract domain from URL-like inputs
         domain = extract_domain_from_url(domain)
 
         # Check if extraction was successful
         if not domain:
-            return render(request, 'check_webapp.html', {
-                'error': 'Unable to extract a valid domain name from your input'
-            })
+            return render(
+                request,
+                "check_webapp.html",
+                {"error": "Unable to extract a valid domain name from your input"},
+            )
 
         # Create context with the domain and initialize all required result variables
         # This ensures the template can safely reference these variables even if checks fail
         context = {
-            'domain': domain,
-            'csp_result': {'status': False, 'issues': [], 'recommendations': []},
-            'cookies_result': {'status': False, 'cookies': [], 'message': 'Not checked'},
-            'cors_result': {'status': False, 'cors_headers': {}, 'message': 'Not checked'},
-            'https_redirect_result': {'status': False, 'redirect_url': None, 'message': 'Not checked'},
-            'referrer_policy_result': {'status': False, 'header_value': None, 'message': 'Not checked'},
-            'sri_result': {'status': 'red', 'resources': [], 'message': 'Not checked'},
-            'x_content_type_options_result': {'status': False, 'header_value': None, 'message': 'Not checked'},
-            'hsts_result': {'status': False, 'data': 'Not checked', 'parsed': {}, 'http_status': None, 'preload_ready': False, 'strength': 'N/A', 'recommendations': []},
-            'security_txt_result': {'status': False, 'data': 'Not checked'}
+            "domain": domain,
+            "csp_result": {"status": False, "issues": [], "recommendations": []},
+            "cookies_result": {
+                "status": False,
+                "cookies": [],
+                "message": "Not checked",
+            },
+            "cors_result": {
+                "status": False,
+                "cors_headers": {},
+                "message": "Not checked",
+            },
+            "https_redirect_result": {
+                "status": False,
+                "redirect_url": None,
+                "message": "Not checked",
+            },
+            "referrer_policy_result": {
+                "status": False,
+                "header_value": None,
+                "message": "Not checked",
+            },
+            "sri_result": {"status": "red", "resources": [], "message": "Not checked"},
+            "x_content_type_options_result": {
+                "status": False,
+                "header_value": None,
+                "message": "Not checked",
+            },
+            "hsts_result": {
+                "status": False,
+                "data": "Not checked",
+                "parsed": {},
+                "http_status": None,
+                "preload_ready": False,
+                "strength": "N/A",
+                "recommendations": [],
+            },
+            "security_txt_result": {"status": False, "data": "Not checked"},
         }
         validation_errors = []
 
@@ -187,129 +220,207 @@ def check_website_security(request):
                 validators.full_domain_validator(domain)
                 requests.get(safe_url_utils(domain), timeout=5)
             except requests.ConnectionError:
-                return render(request, 'check_webapp.html', {
-                    'domain': domain,
-                    'error': f"Invalid domain: {domain} could not be resolved. Please verify the domain name and that the site is accessible."
-                })
+                return render(
+                    request,
+                    "check_webapp.html",
+                    {
+                        "domain": domain,
+                        "error": f"Invalid domain: {domain} could not be resolved. Please verify the domain name and that the site is accessible.",
+                    },
+                )
             except Exception as e:
-                return render(request, 'check_webapp.html', {
-                    'domain': domain,
-                    'error': f"Invalid domain format: {str(e)}"
-                })
+                return render(
+                    request,
+                    "check_webapp.html",
+                    {"domain": domain, "error": f"Invalid domain format: {str(e)}"},
+                )
 
             # Perform all the security checks and catch any exceptions
             try:
                 csp_result = check_csp(domain)
-                if isinstance(csp_result, dict) and csp_result.get('error'):
-                    validation_errors.append(f"CSP check error: {csp_result.get('error')}")
-                context['csp_result'] = csp_result
+                if isinstance(csp_result, dict) and csp_result.get("error"):
+                    validation_errors.append(
+                        f"CSP check error: {csp_result.get('error')}"
+                    )
+                context["csp_result"] = csp_result
             except Exception as e:
                 logger.error(f"Error in CSP check for {domain}: {e}")
                 validation_errors.append(f"CSP check error: {str(e)}")
-                context['csp_result'] = {'status': False, 'issues': [f"Error: {str(e)}"], 'recommendations': ["Verify domain accessibility"]}
+                context["csp_result"] = {
+                    "status": False,
+                    "issues": [f"Error: {str(e)}"],
+                    "recommendations": ["Verify domain accessibility"],
+                }
 
             try:
                 cookies_result = check_cookies(domain)
-                if isinstance(cookies_result, dict) and cookies_result.get('error'):
-                    validation_errors.append(f"Cookies check error: {cookies_result.get('error')}")
-                context['cookies_result'] = cookies_result
+                if isinstance(cookies_result, dict) and cookies_result.get("error"):
+                    validation_errors.append(
+                        f"Cookies check error: {cookies_result.get('error')}"
+                    )
+                context["cookies_result"] = cookies_result
             except Exception as e:
                 logger.error(f"Error in cookies check for {domain}: {e}")
                 validation_errors.append(f"Cookies check error: {str(e)}")
-                context['cookies_result'] = {'status': False, 'cookies': [], 'message': f"Error: {str(e)}"}
+                context["cookies_result"] = {
+                    "status": False,
+                    "cookies": [],
+                    "message": f"Error: {str(e)}",
+                }
 
             try:
                 cors_result = check_cors(domain)
-                if isinstance(cors_result, dict) and cors_result.get('error'):
-                    validation_errors.append(f"CORS check error: {cors_result.get('error')}")
-                context['cors_result'] = cors_result
+                if isinstance(cors_result, dict) and cors_result.get("error"):
+                    validation_errors.append(
+                        f"CORS check error: {cors_result.get('error')}"
+                    )
+                context["cors_result"] = cors_result
             except Exception as e:
                 logger.error(f"Error in CORS check for {domain}: {e}")
                 validation_errors.append(f"CORS check error: {str(e)}")
-                context['cors_result'] = {'status': False, 'cors_headers': {}, 'message': f"Error: {str(e)}"}
+                context["cors_result"] = {
+                    "status": False,
+                    "cors_headers": {},
+                    "message": f"Error: {str(e)}",
+                }
 
             try:
                 https_redirect_result = check_https_redirect(domain)
-                if isinstance(https_redirect_result, dict) and https_redirect_result.get('error'):
-                    validation_errors.append(f"HTTPS redirect check error: {https_redirect_result.get('error')}")
-                context['https_redirect_result'] = https_redirect_result
+                if isinstance(
+                    https_redirect_result, dict
+                ) and https_redirect_result.get("error"):
+                    validation_errors.append(
+                        f"HTTPS redirect check error: {https_redirect_result.get('error')}"
+                    )
+                context["https_redirect_result"] = https_redirect_result
             except Exception as e:
                 logger.error(f"Error in HTTPS redirect check for {domain}: {e}")
                 validation_errors.append(f"HTTPS redirect check error: {str(e)}")
-                context['https_redirect_result'] = {'status': False, 'redirect_url': None, 'message': f"Error: {str(e)}"}
+                context["https_redirect_result"] = {
+                    "status": False,
+                    "redirect_url": None,
+                    "message": f"Error: {str(e)}",
+                }
 
             try:
                 referrer_policy_result = check_referrer_policy(domain)
-                if isinstance(referrer_policy_result, dict) and referrer_policy_result.get('error'):
-                    validation_errors.append(f"Referrer Policy check error: {referrer_policy_result.get('error')}")
-                context['referrer_policy_result'] = referrer_policy_result
+                if isinstance(
+                    referrer_policy_result, dict
+                ) and referrer_policy_result.get("error"):
+                    validation_errors.append(
+                        f"Referrer Policy check error: {referrer_policy_result.get('error')}"
+                    )
+                context["referrer_policy_result"] = referrer_policy_result
             except Exception as e:
                 logger.error(f"Error in Referrer Policy check for {domain}: {e}")
                 validation_errors.append(f"Referrer Policy check error: {str(e)}")
-                context['referrer_policy_result'] = {'status': False, 'header_value': None, 'message': f"Error: {str(e)}"}
+                context["referrer_policy_result"] = {
+                    "status": False,
+                    "header_value": None,
+                    "message": f"Error: {str(e)}",
+                }
 
             try:
                 sri_result = check_sri(domain)
-                if isinstance(sri_result, dict) and sri_result.get('error'):
-                    validation_errors.append(f"SRI check error: {sri_result.get('error')}")
-                context['sri_result'] = sri_result
+                if isinstance(sri_result, dict) and sri_result.get("error"):
+                    validation_errors.append(
+                        f"SRI check error: {sri_result.get('error')}"
+                    )
+                context["sri_result"] = sri_result
             except Exception as e:
                 logger.error(f"Error in SRI check for {domain}: {e}")
                 validation_errors.append(f"SRI check error: {str(e)}")
-                context['sri_result'] = {'status': 'red', 'resources': [], 'message': f"Error: {str(e)}"}
+                context["sri_result"] = {
+                    "status": "red",
+                    "resources": [],
+                    "message": f"Error: {str(e)}",
+                }
 
             try:
                 x_content_type_options_result = check_x_content_type_options(domain)
-                if isinstance(x_content_type_options_result, dict) and x_content_type_options_result.get('error'):
-                    validation_errors.append(f"X-Content-Type-Options check error: {x_content_type_options_result.get('error')}")
-                context['x_content_type_options_result'] = x_content_type_options_result
+                if isinstance(
+                    x_content_type_options_result, dict
+                ) and x_content_type_options_result.get("error"):
+                    validation_errors.append(
+                        f"X-Content-Type-Options check error: {x_content_type_options_result.get('error')}"
+                    )
+                context["x_content_type_options_result"] = x_content_type_options_result
             except Exception as e:
                 logger.error(f"Error in X-Content-Type-Options check for {domain}: {e}")
-                validation_errors.append(f"X-Content-Type-Options check error: {str(e)}")
-                context['x_content_type_options_result'] = {'status': False, 'header_value': None, 'message': f"Error: {str(e)}"}
+                validation_errors.append(
+                    f"X-Content-Type-Options check error: {str(e)}"
+                )
+                context["x_content_type_options_result"] = {
+                    "status": False,
+                    "header_value": None,
+                    "message": f"Error: {str(e)}",
+                }
 
             try:
                 hsts_result = check_hsts(domain)
-                if isinstance(hsts_result, dict) and hsts_result.get('error'):
-                    validation_errors.append(f"HSTS check error: {hsts_result.get('error')}")
-                context['hsts_result'] = hsts_result
+                if isinstance(hsts_result, dict) and hsts_result.get("error"):
+                    validation_errors.append(
+                        f"HSTS check error: {hsts_result.get('error')}"
+                    )
+                context["hsts_result"] = hsts_result
             except Exception as e:
                 logger.error(f"Error in HSTS check for {domain}: {e}")
                 validation_errors.append(f"HSTS check error: {str(e)}")
-                context['hsts_result'] = {'status': False, 'data': f"Error: {str(e)}", 'parsed': {}, 'http_status': None, 'preload_ready': False, 'strength': 'N/A', 'recommendations': []}
+                context["hsts_result"] = {
+                    "status": False,
+                    "data": f"Error: {str(e)}",
+                    "parsed": {},
+                    "http_status": None,
+                    "preload_ready": False,
+                    "strength": "N/A",
+                    "recommendations": [],
+                }
 
             try:
                 security_txt_result = check_security_txt(domain)
-                if isinstance(security_txt_result, dict) and security_txt_result.get('error'):
-                    validation_errors.append(f"Security.txt check error: {security_txt_result.get('error')}")
-                context['security_txt_result'] = security_txt_result
+                if isinstance(security_txt_result, dict) and security_txt_result.get(
+                    "error"
+                ):
+                    validation_errors.append(
+                        f"Security.txt check error: {security_txt_result.get('error')}"
+                    )
+                context["security_txt_result"] = security_txt_result
             except Exception as e:
                 logger.error(f"Error in Security.txt check for {domain}: {e}")
                 validation_errors.append(f"Security.txt check error: {str(e)}")
-                context['security_txt_result'] = {'status': False, 'data': f"Error: {str(e)}"}
+                context["security_txt_result"] = {
+                    "status": False,
+                    "data": f"Error: {str(e)}",
+                }
 
             # Check if we had critical errors that should be shown to the user
             if validation_errors:
-                domain_not_exist = any("domain does not exist" in err.lower() for err in validation_errors)
+                domain_not_exist = any(
+                    "domain does not exist" in err.lower() for err in validation_errors
+                )
                 if domain_not_exist:
-                    context['error'] = f"Domain '{domain}' does not exist"
+                    context["error"] = f"Domain '{domain}' does not exist"
                 elif any("connection" in err.lower() for err in validation_errors):
-                    context['error'] = f"Could not connect to '{domain}'. Please verify the domain name and that the site is accessible."
+                    context["error"] = (
+                        f"Could not connect to '{domain}'. Please verify the domain name and that the site is accessible."
+                    )
                 else:
-                    context['validation_error'] = f"Some tests couldn't be completed for '{domain}'. Please verify the domain name."
-                    context['validation_details'] = validation_errors
+                    context["validation_error"] = (
+                        f"Some tests couldn't be completed for '{domain}'. Please verify the domain name."
+                    )
+                    context["validation_details"] = validation_errors
 
             # Try to save the test report
             try:
-                test_report = TestReport.objects.get(tested_site=domain, test_ran="web-test")
+                test_report = TestReport.objects.get(
+                    tested_site=domain, test_ran="web-test"
+                )
                 test_report.report = context
                 test_report.save()
             except TestReport.DoesNotExist:
                 try:
                     test_report = TestReport.objects.create(
-                        tested_site=domain,
-                        test_ran="web-test",
-                        report=context
+                        tested_site=domain, test_ran="web-test", report=context
                     )
                 except Exception as e:
                     logger.error(f"Failed to create test report: {e}")
@@ -319,11 +430,13 @@ def check_website_security(request):
         except Exception as e:
             # This is a catch-all for any unexpected errors
             logger.error(f"Unexpected error during security checks for {domain}: {e}")
-            context['error'] = f"An unexpected error occurred. Please try again with a valid domain."
+            context["error"] = (
+                f"An unexpected error occurred. Please try again with a valid domain."
+            )
 
-        return render(request, 'check_webapp.html', context)
+        return render(request, "check_webapp.html", context)
 
-    return render(request, 'check_webapp.html')
+    return render(request, "check_webapp.html")
 
 
 def email_test(request):
@@ -340,68 +453,62 @@ def email_test(request):
             )
             return redirect("signup")
 
-        target = request.POST["target"].strip() if "target" in request.POST else ""
-        # Log the input for debugging
-        logger.debug(f"Email test requested for: {target}")
+        context["domain"] = (
+            request.POST["target"].strip() if "target" in request.POST else ""
+        )
+        logger.debug(f"Email test requested for: {context['domain']}")
 
-        if not target:
-            context = {"error": "Please enter a domain name"}
-            return render(request, "check_email.html", context)
+        if not context["domain"]:
+            return render(
+                request, "check_email.html", {"error": "Please enter a domain name"}
+            )
 
-        # Extract domain from URL-like inputs without re-importing
-        target = extract_domain_from_url(target)
+        context["domain"] = extract_domain_from_url(context["domain"])
 
-        if not target:
-            context = {"error": "Unable to extract a valid domain name from your input"}
-            return render(request, "check_email.html", context)
+        if not context["domain"]:
+            return render(
+                request,
+                "check_email.html",
+                {"error": "Unable to extract a valid domain name from your input"},
+            )
 
         # Check if the domain has a valid SOA record
-        soa_check = check_soa_record(target)
+        soa_check = check_soa_record(context["domain"])
         if isinstance(soa_check, dict) and "error" in soa_check:
             context = {"error": soa_check["error"]}
             return render(request, "check_email.html", context)
         elif not soa_check:
-            context = {"error": "The provided domain name doesn't appear to be valid or doesn't exist"}
+            context = {
+                "error": "The provided domain name doesn't appear to be valid or doesn't exist"
+            }
             return render(request, "check_email.html", context)
 
         # Domain appears valid, proceed with tests
         dkim_selector = "default"  # You may want to allow user input for this
 
-        context['domain'] = target
-        context['dnssec'] = check_dnssec(target)
-        #mx_servers = check_mx(target)
-        #context['mx'] = {'servers': mx_servers, 'tls': check_tls(mx_servers)}
+        dnssec_validator = Dnssec(context["domain"])
+        context["dnssec"] = dnssec_validator.check_dnssec()
+        # mx_servers = check_mx(target)
+        # context['mx'] = {'servers': mx_servers, 'tls': check_tls(mx_servers)}
 
-        context['spf'] = check_spf(target)
-        context['dmarc'] = check_dmarc(target)
+        context["spf"] = check_spf(context["domain"])
+        context["dmarc"] = check_dmarc(context["domain"])
         # Check DKIM with specific selector
-        dkim_result, is_valid = check_dkim(target, selector=dkim_selector)
-        context['dkim'] = dkim_result
-        context['dkim_valid'] = is_valid
-
-        # Check if any errors were returned from the checks
-        has_error = False
-        for check_name in ['dnssec', 'spf', 'dmarc']:
-            if check_name in context and isinstance(context[check_name], dict) and context[check_name].get('error'):
-                if 'domain does not exist' in context[check_name]['error'].lower():
-                    context = {"error": f"The domain '{target}' does not exist"}
-                    has_error = True
-                    break
-
-        if has_error:
-            return render(request, "check_email.html", context)
+        dkim_result, is_valid = check_dkim(context["domain"], selector=dkim_selector)
+        context["dkim"] = dkim_result
+        context["dkim_valid"] = is_valid
 
         try:
-            test_report = TestReport.objects.get(tested_site=target, test_ran="email-test")
+            test_report = TestReport.objects.get(
+                tested_site=context["domain"], test_ran="email-test"
+            )
             test_report.report = context
             test_report.save()
         except Exception as e:
             logger.error(f"Error saving test report: {e}")
             try:
                 test_report = TestReport.objects.create(
-                    tested_site=target,
-                    test_ran="email-test",
-                    report=context
+                    tested_site=context["domain"], test_ran="email-test", report=context
                 )
             except Exception as e:
                 logger.error(f"Failed to create test report: {e}")
@@ -423,7 +530,13 @@ def file_test(request):
             context.update(file_check(file_to_check, file_to_check_name))
             return render(request, "check_file.html", context)
         else:
-            return render(request, "check_file.html", {"error": "There was an error with the provided file. Please try again later."})
+            return render(
+                request,
+                "check_file.html",
+                {
+                    "error": "There was an error with the provided file. Please try again later."
+                },
+            )
     else:
         return render(request, "check_file.html")
 
@@ -488,7 +601,7 @@ def web_server_test(request):
             context = {"error": "Unable to extract a valid domain name from your input"}
             return render(request, "check_services.html", context)
 
-        context = {'domain': domain}
+        context = {"domain": domain}
 
         # Perform the web server check and handle potential errors
         try:
@@ -507,15 +620,15 @@ def web_server_test(request):
 
         # Try to save the test report
         try:
-            test_report = TestReport.objects.get(tested_site=domain, test_ran="infra-test")
+            test_report = TestReport.objects.get(
+                tested_site=domain, test_ran="infra-test"
+            )
             test_report.report = context
             test_report.save()
         except TestReport.DoesNotExist:
             try:
                 test_report = TestReport.objects.create(
-                    tested_site=domain,
-                    test_ran="infra-test",
-                    report=context
+                    tested_site=domain, test_ran="infra-test", report=context
                 )
             except Exception as e:
                 logger.error(f"Failed to create test report: {e}")
@@ -630,7 +743,7 @@ def record_generator(request):
     context = {}
 
     if request.method == "POST":
-        if 'spf' in request.POST:
+        if "spf" in request.POST:
             spf_form = SPFRecordForm(request.POST)
             if spf_form.is_valid():
                 data = spf_form.cleaned_data
@@ -653,15 +766,16 @@ def record_generator(request):
                         else:
                             messages.error(
                                 request,
-                                "One of the specified hosts/IP addresses does not match the expected format. Please correct your entered data."
+                                "One of the specified hosts/IP addresses does not match the expected format. Please correct your entered data.",
                             )
                             context = {"spf_form": spf_form, "dmarc_form": dmarc_form}
-                            return render(request, "email_policy_generator.html",
-                                          context)
+                            return render(
+                                request, "email_policy_generator.html", context
+                            )
                 record += data["policy"]
                 context["spf_record"] = record
 
-        elif 'dmarc' in request.POST:
+        elif "dmarc" in request.POST:
             dmarc_form = DMARCRecordForm(user=request.user, data=request.POST)
             if dmarc_form.is_valid():
                 data = dmarc_form.cleaned_data
@@ -721,7 +835,7 @@ def dmarc_dl(request, domain, mailfrom, timestamp):
             headers={
                 "Content-Type": "application/xml",
                 "Content-Disposition": f"attachment; "
-                                       f'filename="dmarc_{domain}_{mailfrom}_{timestamp}.xml"',
+                f'filename="dmarc_{domain}_{mailfrom}_{timestamp}.xml"',
             },
         )
         return response
@@ -754,114 +868,131 @@ def dmarc_upload(request):
 def pdf_from_template(request, test, site):
     report = TestReport.objects.get(tested_site=site, test_ran=test).report
 
-    css_path = os.path.join(settings.STATIC_DIR, 'css/style.css')
-    bootstrap_path = os.path.join(settings.STATIC_DIR, 'css/bootstrap.css')
+    css_path = os.path.join(settings.STATIC_DIR, "css/style.css")
+    bootstrap_path = os.path.join(settings.STATIC_DIR, "css/bootstrap.css")
 
-    with open(css_path, 'r') as f:
+    with open(css_path, "r") as f:
         css = f.read()
 
-    with open(bootstrap_path, 'r') as f:
+    with open(bootstrap_path, "r") as f:
         bootstrap = f.read()
 
-    css_content = bootstrap + '\n' + css
+    css_content = bootstrap + "\n" + css
 
     # Calculate stats
     count_good = 0
     count_vulnerable = 0
     if test == "web-test":
         for key, value in report.items():
-            if isinstance(value, dict) and 'status' in value:
-                if value['status'] is False:
+            if isinstance(value, dict) and "status" in value:
+                if value["status"] is False:
                     count_vulnerable += 1
                 else:
                     count_good += 1
 
     elif test == "email-test":
-        if report['spf']['valid'] is True:
+        if report["spf"]["valid"] is True:
             count_good += 1
         else:
             count_vulnerable += 1
-        if report['dmarc']['valid'] is True:
+        if report["dmarc"]["valid"] is True:
             count_good += 1
         else:
             count_vulnerable += 1
-        if report['dnssec']['enabled'] is True:
+        if report["dnssec"]["enabled"] is True:
             count_good += 1
         else:
             count_vulnerable += 1
 
-    report['good'] = count_good
-    report['vulnerable'] = count_vulnerable
+    report["good"] = count_good
+    report["vulnerable"] = count_vulnerable
 
     # Generate pie chart
     try:
-        data = {'Good': count_good, 'Vulnerable': count_vulnerable}
+        data = {"Good": count_good, "Vulnerable": count_vulnerable}
         labels = [key for key, value in data.items() if value != 0]
         sizes = [value for value in data.values() if value != 0]
-        colors = ['green', 'red']
+        colors = ["green", "red"]
         plt.figure(figsize=(4, 4))
-        plt.pie(sizes, labels=labels, labeldistance=0.3, colors=colors, autopct=None,
-                startangle=90, shadow=False)
-        plt.axis('equal')
+        plt.pie(
+            sizes,
+            labels=labels,
+            labeldistance=0.3,
+            colors=colors,
+            autopct=None,
+            startangle=90,
+            shadow=False,
+        )
+        plt.axis("equal")
 
         # Save the chart as a PNG image
         buffer = BytesIO()
-        plt.savefig(buffer, format='png')
+        plt.savefig(buffer, format="png")
         buffer.seek(0)
         image_png = buffer.getvalue()
         buffer.close()
-        image_base64 = base64.b64encode(image_png).decode('utf-8')
-        report['img'] = image_base64
+        image_base64 = base64.b64encode(image_png).decode("utf-8")
+        report["img"] = image_base64
     except ValueError as e:
         pass
 
     template = get_template("pdf_wrapper.html")
-    report['site'] = site
-    report['test'] = test
+    report["site"] = site
+    report["test"] = test
 
     html_out = template.render(report)
-    pdf_file = weasyprint.HTML(string=html_out).write_pdf(stylesheets=[weasyprint.CSS(string=css_content)])
+    pdf_file = weasyprint.HTML(string=html_out).write_pdf(
+        stylesheets=[weasyprint.CSS(string=css_content)]
+    )
 
-    response = HttpResponse(pdf_file, content_type='application/pdf')
-    response['Content-Disposition'] = f'attachment; filename="tp_{test}_{site}_report.pdf"'
+    response = HttpResponse(pdf_file, content_type="application/pdf")
+    response["Content-Disposition"] = (
+        f'attachment; filename="tp_{test}_{site}_report.pdf"'
+    )
     return response
 
 
 def url_test(request):
-    lookyloo = Lookyloo('https://lookyloo.circl.lu')
-    if request.method == 'POST':
-        url = request.POST.get('target')
+    lookyloo = Lookyloo("https://lookyloo.circl.lu")
+    if request.method == "POST":
+        url = request.POST.get("target")
 
         # Ensure URL has a proper protocol prefix
-        if url and not url.startswith(('http://', 'https://')):
-            url = 'https://' + url
+        if url and not url.startswith(("http://", "https://")):
+            url = "https://" + url
             logger.info(f"Added https:// prefix to URL: {url}")
 
         if lookyloo.is_up:
-            context = {'lookyloo_status': lookyloo.is_up}
+            context = {"lookyloo_status": lookyloo.is_up}
             try:
                 capture_uuid = lookyloo.submit(url=url, quiet=True)
-                while lookyloo.get_status(capture_uuid)['status_code'] != 1:
-                    if lookyloo.get_status(capture_uuid)['status_code'] == -1:
-                        context['error'] = 'Lookyloo has encountered an issue with the requested capture. Please try again.'
+                while lookyloo.get_status(capture_uuid)["status_code"] != 1:
+                    if lookyloo.get_status(capture_uuid)["status_code"] == -1:
+                        context["error"] = (
+                            "Lookyloo has encountered an issue with the requested capture. Please try again."
+                        )
                         break
                     sleep(5)
 
-                if 'error' not in context:
+                if "error" not in context:
                     capture = get_capture_result(lookyloo, capture_uuid)
-                    context['capture'] = capture
+                    context["capture"] = capture
                     screenshot_stream = lookyloo.get_screenshot(capture_uuid)
-                    screenshot = base64.b64encode(screenshot_stream.read()).decode('utf-8')
-                    context['screenshot'] = screenshot
+                    screenshot = base64.b64encode(screenshot_stream.read()).decode(
+                        "utf-8"
+                    )
+                    context["screenshot"] = screenshot
             except Exception as e:
                 logger.error(f"Error in URL test for {url}: {str(e)}")
-                context['error'] = f"An error occurred during the capture: {str(e)}"
+                context["error"] = f"An error occurred during the capture: {str(e)}"
 
-            return render(request, 'check_lookyloo.html', context)
+            return render(request, "check_lookyloo.html", context)
     else:
         recent_captures = get_recent_captures(lookyloo)
-        return render(request, 'check_lookyloo.html', {'recent_captures': recent_captures})
-    return render(request, 'check_lookyloo.html')
+        return render(
+            request, "check_lookyloo.html", {"recent_captures": recent_captures}
+        )
+    return render(request, "check_lookyloo.html")
 
 
 @csrf_exempt
@@ -870,14 +1001,15 @@ def receive_csp_report(request, endpoint_uuid):
     """Handle incoming CSP violation reports"""
     try:
         # Rate limiting
-        cache_key = f'csp_rate_{endpoint_uuid}'
-        if cache.get(cache_key, 0) >= getattr(settings, 'CSP_RATE_LIMIT', 1000):
+        cache_key = f"csp_rate_{endpoint_uuid}"
+        if cache.get(cache_key, 0) >= getattr(settings, "CSP_RATE_LIMIT", 1000):
             return JsonResponse({"error": "Rate limit exceeded"}, status=429)
         cache.incr(cache_key, 1)
 
         # Get endpoint
-        endpoint = get_object_or_404(CSPEndpoint, endpoint_uuid=endpoint_uuid,
-                                     is_active=True)
+        endpoint = get_object_or_404(
+            CSPEndpoint, endpoint_uuid=endpoint_uuid, is_active=True
+        )
 
         # Basic origin validation
         origin = request.headers.get("Origin") or request.META.get("HTTP_REFERER")
@@ -890,7 +1022,7 @@ def receive_csp_report(request, endpoint_uuid):
             # CSP reports can come in two formats:
             # 1. {"csp-report": {...}}
             # 2. {...}
-            csp_data = report_data.get('csp-report', report_data)
+            csp_data = report_data.get("csp-report", report_data)
         except json.JSONDecodeError:
             return JsonResponse({"error": "Invalid JSON"}, status=400)
 
@@ -898,7 +1030,7 @@ def receive_csp_report(request, endpoint_uuid):
         CSPReport.objects.create(
             endpoint=endpoint,
             report_data=csp_data,
-            user_agent=request.headers.get('User-Agent')
+            user_agent=request.headers.get("User-Agent"),
         )
 
         return JsonResponse({"status": "success"}, status=201)
@@ -915,8 +1047,9 @@ def manage_endpoints(request):
         endpoint_uuid = request.POST.get("endpoint_uuid")
 
         if endpoint_uuid:
-            endpoint = get_object_or_404(CSPEndpoint, endpoint_uuid=endpoint_uuid,
-                                         user=request.user)
+            endpoint = get_object_or_404(
+                CSPEndpoint, endpoint_uuid=endpoint_uuid, user=request.user
+            )
 
             if action == "delete":
                 endpoint.delete()
@@ -934,20 +1067,24 @@ def create_endpoint(request):
     if request.method == "POST":
         allowed_origin = request.POST.get("allowed_origin", "").strip()
         if not allowed_origin:
-            return render(request, "create_csp_endpoint.html",
-                          {"error": "Allowed origin is required."})
+            return render(
+                request,
+                "create_csp_endpoint.html",
+                {"error": "Allowed origin is required."},
+            )
 
         endpoint = CSPEndpoint.objects.create(
-            user=request.user,
-            allowed_origin=allowed_origin
+            user=request.user, allowed_origin=allowed_origin
         )
 
         endpoint_url = request.build_absolute_uri(
-            f'/csp/report/{endpoint.endpoint_uuid}/')
-        return render(request, "create_csp_endpoint.html", {
-            "endpoint_url": endpoint_url,
-            "endpoint": endpoint
-        })
+            f"/csp/report/{endpoint.endpoint_uuid}/"
+        )
+        return render(
+            request,
+            "create_csp_endpoint.html",
+            {"endpoint_url": endpoint_url, "endpoint": endpoint},
+        )
 
     return render(request, "create_csp_endpoint.html")
 
@@ -955,25 +1092,25 @@ def create_endpoint(request):
 @login_required
 def view_reports(request, endpoint_uuid):
     """View to display CSP reports and analytics"""
-    endpoint = get_object_or_404(CSPEndpoint, endpoint_uuid=endpoint_uuid,
-                                 user=request.user)
-    days = min(int(request.GET.get('days', 30)), 365)
+    endpoint = get_object_or_404(
+        CSPEndpoint, endpoint_uuid=endpoint_uuid, user=request.user
+    )
+    days = min(int(request.GET.get("days", 30)), 365)
     start_date = datetime.now() - timedelta(days=days)
 
     # Basic statistics
     reports = CSPReport.objects.filter(
-        endpoint=endpoint,
-        occurred_at__gte=start_date
-    ).order_by('-occurred_at')
+        endpoint=endpoint, occurred_at__gte=start_date
+    ).order_by("-occurred_at")
 
     # Calculate some basic stats
     stats = {
-        'total_reports': reports.count(),
-        'recent_reports': reports[:100],  # Show last 100 reports
+        "total_reports": reports.count(),
+        "recent_reports": reports[:100],  # Show last 100 reports
     }
 
-    return render(request, "view_csp_reports.html", {
-        "endpoint": endpoint,
-        "stats": stats,
-        "reports": stats['recent_reports']
-    })
+    return render(
+        request,
+        "view_csp_reports.html",
+        {"endpoint": endpoint, "stats": stats, "reports": stats["recent_reports"]},
+    )
