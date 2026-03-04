@@ -18,7 +18,6 @@ from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urljoin, urlparse
 
-import dns.dnssec
 import dns.message
 import dns.name
 import dns.rdatatype
