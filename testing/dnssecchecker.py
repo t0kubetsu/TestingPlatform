@@ -8,7 +8,7 @@ Usage:
     python dnssec_checker.py <domain> [record_type]
 
 Examples:
-    python dnssec_checker.py nc3.lu
+    python dnssec_checker.py example.com
     python dnssec_checker.py example.com AAAA
 
 Requirements:
@@ -39,6 +39,8 @@ import dns.rrset
 import requests
 from dns.rdata import Rdata
 
+# ─── Logging / output helpers ────────────────────────────────────────────────
+
 logging.basicConfig(stream=sys.stdout, level=logging.WARNING, format="%(message)s")
 logger = logging.getLogger("dnssec")
 
@@ -68,6 +70,7 @@ DIGEST_MAP = {
     4: "SHA-384",
 }
 
+# All 13 root name servers (IANA)
 ROOT_SERVERS = {
     "a.root-servers.net": "198.41.0.4",
     "b.root-servers.net": "170.247.170.2",
@@ -96,8 +99,11 @@ def _pick_root_server() -> tuple[str, str]:
     return name, ROOT_SERVERS[name]
 
 
-DNS_TIMEOUT = 5
+DNS_TIMEOUT = 5  # seconds per UDP query
 DNS_PORT = 53
+
+
+# ─── Low-level DNS helpers ────────────────────────────────────────────────────
 
 
 def _udp_query(
@@ -195,6 +201,9 @@ def _get_rrset(
     return _extract_rrsets(resp, rdtype)
 
 
+# ─── Formatting helpers ───────────────────────────────────────────────────────
+
+
 def _fmt_ds(ds: Rdata) -> str:
     digest_name = DIGEST_MAP.get(ds.digest_type, str(ds.digest_type))
     return f"DS={ds.key_tag}/{digest_name}"
@@ -212,6 +221,9 @@ def _fmt_rrsig(rrsig: Rdata) -> str:
 
 def _algo_name(alg: int) -> str:
     return ALGORITHM_MAP.get(alg, f"ALG{alg}")
+
+
+# ─── Validation helpers ───────────────────────────────────────────────────────
 
 
 def _ds_matches_dnskey(ds: Rdata, dnskey: Rdata, zone: str) -> bool:
@@ -245,6 +257,9 @@ def _validate_rrsig_over_rrset(
     return False, None
 
 
+# ─── Main checker class ───────────────────────────────────────────────────────
+
+
 class DNSSECChecker:
     """
     Full DNSSEC chain-of-trust validator.
@@ -261,14 +276,18 @@ class DNSSECChecker:
         self.errors: list[str] = []
         self.warnings: list[str] = []
 
+    # ── Public entry point ────────────────────────────────────────────────────
+
     def check(self) -> bool:
         domain_label = self.domain.rstrip(".")
         print(f"\n{'=' * 70}")
         print(f"  DNSSEC Validation for: {domain_label}")
         print(f"{'=' * 70}\n")
 
+        # Build zone hierarchy: ['.', 'com.', 'example.com.']
         zones = self._build_zone_list(self.domain)
 
+        # Load trust anchor DS for root
         trust_anchor_ds = self._load_trust_anchor()
         if not trust_anchor_ds:
             self._fail("Could not load IANA trust anchor")
@@ -313,97 +332,115 @@ class DNSSECChecker:
 
         return not bool(self.errors)
 
+    # ── Zone list builder ─────────────────────────────────────────────────────
+
     def _build_zone_list(self, fqdn: str) -> list[str]:
         """
-        Return the chain of *actual DNS zones* from root to the zone that
-        is authoritative for fqdn, e.g.:
-            example.com     → ['.', 'com.', 'example.com.']
-            www.example.com → ['.', 'com.', 'example.com.'] ← no extra zone
+        Walk the DNS hierarchy from root down to fqdn using a proper iterative
+        resolver, detecting real zone cuts via NS delegations.
 
-        We detect real zone cuts by querying for a SOA record at each
-        candidate name.  If the SOA answer section contains the candidate
-        name itself (aa=1 answer) that candidate is a zone apex; otherwise
-        it is just a record inside an ancestor zone and we skip it.
+        Returns both the ordered zone list AND populates self._zone_ns_map with
+        the authoritative NS IPs for each zone, so downstream methods can query
+        the correct servers.
+
+            example.com     → ['.', 'com.', 'example.com.']
+            www.example.com → ['.', 'com.', 'example.com.']
         """
         name = dns.name.from_text(fqdn)
-        labels = name.labels
+        labels = name.labels  # e.g. (b'www', b'example', b'com', b'')
 
-        # Build candidate zones from TLD down to the full name
+        # Ordered candidate zones from TLD down to fqdn itself
         candidates: list[str] = []
         for i in range(len(labels) - 1, 0, -1):
             zone = dns.name.Name(labels[i - 1 :]).to_text()
             if zone != ".":
                 candidates.append(zone)
 
+        # ns_map: zone → list of (name, ip) for its authoritative NS
+        self._zone_ns_map: dict[str, list[tuple[str, str]]] = {}
+
+        root_ns = [_pick_root_server()]
+        self._zone_ns_map["."] = root_ns
+
         zones = ["."]
-        _, root_ns_ip = _pick_root_server()
-        # Start resolution from a root server; after each confirmed zone we
-        # use one of its own nameservers for the next query.
-        current_ns_ip = root_ns_ip
+        # current_ns_list always holds the NS list of the innermost confirmed zone;
+        # it is passed into _follow_delegation and replaced when a new zone is found.
+        current_ns_list: list[tuple[str, str]] = root_ns
 
         for candidate in candidates:
-            is_zone = self._is_zone_apex(candidate, current_ns_ip)
-            if is_zone:
+            # Ask the current best NS: "do you delegate candidate?"
+            # A real delegation returns NS records in the AUTHORITY section
+            # (non-authoritative referral) with no SOA in AUTHORITY.
+            # The zone apex itself returns NS in the ANSWER section (aa=1).
+            ns_list = self._follow_delegation(candidate, current_ns_list[0][1])
+            if ns_list:
                 zones.append(candidate)
-                # Update resolver to use the new zone's own NS for the next step
-                new_ns_ip = self._get_first_ns_ip(candidate, current_ns_ip)
-                if new_ns_ip:
-                    current_ns_ip = new_ns_ip
+                self._zone_ns_map[candidate] = ns_list
+                current_ns_list = ns_list
+            # else: candidate is not a zone apex — it lives inside the current zone
 
         return zones
 
-    def _is_zone_apex(self, candidate: str, ns_ip: str) -> bool:
+    def _follow_delegation(
+        self, candidate: str, parent_ns_ip: str
+    ) -> list[tuple[str, str]]:
         """
-        Return True if *candidate* is the apex of its own zone.
+        Query parent_ns_ip for the NS records of *candidate*.
 
-        We send a SOA query with DO=1.  A real zone apex returns the SOA
-        in the ANSWER section (aa bit set).  A name that is merely a record
-        inside a parent zone returns the parent's SOA in the AUTHORITY section.
+        Returns a list of (ns_name, ip) if *candidate* is its own zone
+        (either a proper delegation referral OR an authoritative apex answer).
+        Returns an empty list if *candidate* is just a name inside the
+        current zone (i.e. the parent returns a SOA in AUTHORITY instead).
         """
         try:
-            resp = _udp_query(candidate, dns.rdatatype.SOA, ns_ip)
-            for rr in resp.answer:
-                if rr.rdtype == dns.rdatatype.SOA:
-                    # The answer contains a SOA whose owner matches the candidate
-                    if rr.name == dns.name.from_text(candidate):
-                        return True
-            return False
-        except Exception:
-            # On timeout / SERVFAIL assume it is not a separate zone
-            return False
+            resp = _udp_query(candidate, dns.rdatatype.NS, parent_ns_ip)
+        except RuntimeError:
+            return []
 
-    def _get_first_ns_ip(self, zone: str, fallback_ns_ip: str) -> Optional[str]:
-        """
-        Return the IP of the first nameserver we can resolve for *zone*,
-        preferring glue records from the delegation response.
-        """
-        try:
-            resp = _udp_query(zone, dns.rdatatype.NS, fallback_ns_ip)
-            ns_names: list[str] = []
-            for section in (resp.answer, resp.authority):
-                for rr in section:
-                    if rr.rdtype == dns.rdatatype.NS:
-                        ns_names = [r.target.to_text() for r in rr]
-                        break
-                if ns_names:
+        candidate_name = dns.name.from_text(candidate)
+
+        # Collect NS names from ANSWER (apex, aa=1) or AUTHORITY (referral)
+        ns_names: list[str] = []
+        glue: dict[str, str] = {}
+
+        # Check ANSWER first (authoritative apex)
+        for rr in resp.answer:
+            if rr.rdtype == dns.rdatatype.NS and rr.name == candidate_name:
+                ns_names = [r.target.to_text() for r in rr]
+                break
+
+        # Then AUTHORITY (delegation referral from parent)
+        if not ns_names:
+            for rr in resp.authority:
+                if rr.rdtype == dns.rdatatype.NS and rr.name == candidate_name:
+                    ns_names = [r.target.to_text() for r in rr]
                     break
+                # If authority has a SOA for an ancestor, candidate is NOT its own zone
+                if rr.rdtype == dns.rdatatype.SOA:
+                    return []
 
-            glue: dict[str, str] = {}
-            for rr in resp.additional:
-                if rr.rdtype == dns.rdatatype.A:
-                    glue[rr.name.to_text()] = rr[0].address
+        if not ns_names:
+            return []
 
-            for name in ns_names:
-                if name in glue:
-                    return glue[name]
+        # Collect glue from ADDITIONAL
+        for rr in resp.additional:
+            if rr.rdtype == dns.rdatatype.A:
+                glue[rr.name.to_text()] = rr[0].address
+
+        # Resolve NS IPs (prefer glue, fall back to system resolver)
+        result: list[tuple[str, str]] = []
+        for ns_name in ns_names:
+            if ns_name in glue:
+                result.append((ns_name, glue[ns_name]))
+            else:
                 try:
-                    ans = dns.resolver.resolve(name, "A")
-                    return ans[0].address
+                    ans = dns.resolver.resolve(ns_name, "A")
+                    result.append((ns_name, ans[0].address))
                 except Exception:
-                    continue
-        except Exception:
-            pass
-        return None
+                    pass
+        return result
+
+    # ── Trust anchor ──────────────────────────────────────────────────────────
 
     def _load_trust_anchor(self) -> list[Rdata]:
         print(f"{'─' * 70}")
@@ -457,6 +494,8 @@ class DNSSECChecker:
             self._fail("No active trust anchor DS records found")
         return active
 
+    # ── Root zone check ───────────────────────────────────────────────────────
+
     def _check_root(
         self,
         trust_anchor_ds: list[Rdata],
@@ -466,6 +505,7 @@ class DNSSECChecker:
         print("  Zone: . (root)")
         print(f"{'─' * 70}")
 
+        # Pick a root server
         root_ns_name, root_ns_ip = _pick_root_server()
 
         # Fetch root DNSKEY + RRSIG
@@ -520,6 +560,8 @@ class DNSSECChecker:
         # All root DNSKEYs are now trusted
         validated_keys["."] = dnskey_rrset
         return True
+
+    # ── Per-zone check ────────────────────────────────────────────────────────
 
     def _check_zone(
         self,
@@ -645,13 +687,15 @@ class DNSSECChecker:
         validated_keys[child_zone] = dnskey_rrset
         return True
 
+    # ── Final record validation ───────────────────────────────────────────────
+
     def _check_final_rrset(
         self,
         zone: str,
         zone_dnskeys: dns.rrset.RRset,
     ) -> bool:
         rdtype_text = dns.rdatatype.to_text(self.rdtype)
-        qname = self.domain
+        qname = self.domain  # e.g. "example.com."
 
         print(f"\n{'─' * 70}")
         print(f"  Record validation: {qname} {rdtype_text}")
@@ -715,25 +759,17 @@ class DNSSECChecker:
 
         return True
 
+    # ── Nameserver helpers ────────────────────────────────────────────────────
+
     def _get_ns_ip_for_zone(self, zone: str, validated_keys: dict) -> Optional[str]:
-        """Return an IP for a nameserver of zone (root → use hardcoded list)."""
+        """Return an authoritative NS IP for zone, using the map built during
+        zone-list discovery so we always query the correct server."""
+        ns_map = getattr(self, "_zone_ns_map", {})
+        if zone in ns_map and ns_map[zone]:
+            return ns_map[zone][0][1]
         if zone == ".":
             _, ip = _pick_root_server()
             return ip
-
-        # For other zones we already resolved their NS during parent traversal
-        # but we can also query the system resolver
-        try:
-            ns_list = dns.resolver.resolve(zone, "NS")
-            for ns_rr in ns_list:
-                ns_name = ns_rr.target.to_text()
-                try:
-                    a_list = dns.resolver.resolve(ns_name, "A")
-                    return a_list[0].address
-                except Exception:
-                    continue
-        except Exception:
-            pass
         return None
 
     def _resolve_ns_for_child(
@@ -777,25 +813,25 @@ class DNSSECChecker:
     def _get_authoritative_ns(
         self, zone: str, zone_dnskeys: dns.rrset.RRset
     ) -> list[tuple[str, str]]:
-        """Return authoritative NS list for zone using system resolver as fallback."""
-        try:
-            ns_ans = dns.resolver.resolve(zone, "NS")
-            result = []
-            for ns_rr in ns_ans:
-                ns_name = ns_rr.target.to_text()
-                try:
-                    a_ans = dns.resolver.resolve(ns_name, "A")
-                    result.append((ns_name, a_ans[0].address))
-                except Exception:
-                    pass
-            return result
-        except Exception:
-            return []
+        """Return the authoritative NS list for zone from the map built during
+        zone-list discovery.  This guarantees we use the actual authoritative
+        servers rather than whatever the system resolver happens to return."""
+        ns_map = getattr(self, "_zone_ns_map", {})
+        if zone in ns_map and ns_map[zone]:
+            return ns_map[zone]
+        # Fallback: should rarely be needed
+        if zone == ".":
+            return [_pick_root_server()]
+        return []
+
+    # ── Error recording ───────────────────────────────────────────────────────
 
     def _fail(self, msg: str):
         self.errors.append(msg)
         print(f"  {RED} ERROR: {msg}")
 
+
+# ─── Entry point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
