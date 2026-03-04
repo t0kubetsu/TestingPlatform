@@ -6,7 +6,6 @@ import logging
 import os
 import re
 import socket
-from datetime import datetime
 from io import BytesIO
 from time import sleep
 from typing import Any, Dict
@@ -62,7 +61,6 @@ from .models import (
     TestReport,
 )
 
-# Get a logger for this module
 logger = logging.getLogger(__name__)
 
 BASE_URL = os.getenv("BASE_URL", "localhost:8000")
@@ -431,7 +429,7 @@ def check_website_security(request):
             # This is a catch-all for any unexpected errors
             logger.error(f"Unexpected error during security checks for {domain}: {e}")
             context["error"] = (
-                f"An unexpected error occurred. Please try again with a valid domain."
+                "An unexpected error occurred. Please try again with a valid domain."
             )
 
         return render(request, "check_webapp.html", context)
@@ -488,6 +486,7 @@ def email_test(request):
 
         dnssec_validator = Dnssec(context["domain"])
         context["dnssec"] = dnssec_validator.check_dnssec()
+
         # mx_servers = check_mx(target)
         # context['mx'] = {'servers': mx_servers, 'tls': check_tls(mx_servers)}
 
@@ -934,6 +933,7 @@ def pdf_from_template(request, test, site):
         image_base64 = base64.b64encode(image_png).decode("utf-8")
         report["img"] = image_base64
     except ValueError as e:
+        logger.debug(f"Unable to generate pie chart{e}")
         pass
 
     template = get_template("pdf_wrapper.html")
@@ -1096,7 +1096,7 @@ def view_reports(request, endpoint_uuid):
         CSPEndpoint, endpoint_uuid=endpoint_uuid, user=request.user
     )
     days = min(int(request.GET.get("days", 30)), 365)
-    start_date = datetime.now() - timedelta(days=days)
+    start_date = datetime.datetime.now() - datetime.timedelta(days=days)
 
     # Basic statistics
     reports = CSPReport.objects.filter(
