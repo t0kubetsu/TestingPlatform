@@ -319,7 +319,9 @@ class DNSSECChecker:
 
         # ── Final: Validate the A/AAAA/etc. record itself ─────────────────────
         target_zone = zones[-1]
-        self._check_final_rrset(target_zone, validated_keys[target_zone])
+        self._check_final_rrset(
+            target_zone, validated_keys[target_zone], validated_keys=validated_keys
+        )
 
         print(f"\n{'=' * 70}")
         if self.errors:
@@ -693,9 +695,33 @@ class DNSSECChecker:
         self,
         zone: str,
         zone_dnskeys: dns.rrset.RRset,
+        qname: Optional[str] = None,
+        depth: int = 0,
+        validated_keys: Optional[dict] = None,
     ) -> bool:
+        """
+        Validate the target RRset for qname in zone.
+
+        If the authoritative server returns a CNAME instead of the requested
+        type, we:
+          1. Validate the CNAME RRset + RRSIG with the current zone's keys.
+          2. Walk the zone chain for the CNAME target starting from root,
+             reusing any already-validated zone keys (so root / TLD zones
+             already walked are not re-checked from scratch).
+
+        depth guards against infinite CNAME loops (max 8 hops).
+        validated_keys is the shared dict of already-validated zone DNSKEYs;
+        it is passed through so CNAME follow-ups can skip zones already done.
+        """
+        MAX_CNAME_DEPTH = 8
+        if depth > MAX_CNAME_DEPTH:
+            self._fail("CNAME chain too deep (> 8 hops) — possible loop")
+            return False
+
+        if qname is None:
+            qname = self.domain  # e.g. "data.iana.org."
+
         rdtype_text = dns.rdatatype.to_text(self.rdtype)
-        qname = self.domain  # e.g. "example.com."
 
         print(f"\n{'─' * 70}")
         print(f"  Record validation: {qname} {rdtype_text}")
@@ -706,58 +732,139 @@ class DNSSECChecker:
             self._fail(f"Could not find authoritative NS for {zone}")
             return False
 
-        rrset = rrsig_rrset = None
+        # ── Query for the requested rdtype ────────────────────────────────────
+        raw_resp = None
         for ns_name, ns_ip in ns_list:
             print(f"\n  Querying {ns_name} ({ns_ip}) for {qname} {rdtype_text}")
             try:
-                rrset, rrsig_rrset = _get_rrset(qname, self.rdtype, ns_ip)
-                if rrset:
-                    break
+                raw_resp = _udp_query(qname, self.rdtype, ns_ip)
+                break
             except RuntimeError:
                 continue
 
-        if not rrset:
-            # Could be NXDOMAIN or genuinely no record — check NSEC/NSEC3 for proof
-            print(f"  {RED} No {rdtype_text} record found for {qname}")
-            self._fail(f"No {rdtype_text} record for {qname}")
+        if raw_resp is None:
+            self._fail(f"No response for {qname} {rdtype_text}")
             return False
 
-        print(f"  {GREEN} Found {len(rrset)} {rdtype_text} record(s):")
-        for r in rrset:
-            print(f"  {INFO}   {qname} {rrset.ttl} IN {rdtype_text} {r.to_text()}")
+        # ── Check answer section for the requested type OR a CNAME ───────────
+        rrset = rrsig_rrset = None
+        cname_rrset = cname_rrsig = None
 
-        if not rrsig_rrset:
-            self._fail(f"No RRSIG found over {qname} {rdtype_text} RRset")
-            return False
+        for rr in raw_resp.answer:
+            if rr.rdtype == self.rdtype and rrset is None:
+                rrset = rr
+            elif rr.rdtype == dns.rdatatype.CNAME and cname_rrset is None:
+                cname_rrset = rr
+            elif rr.rdtype == dns.rdatatype.RRSIG:
+                for sig in rr:
+                    if sig.type_covered == self.rdtype and rrsig_rrset is None:
+                        rrsig_rrset = rr
+                    elif (
+                        sig.type_covered == dns.rdatatype.CNAME and cname_rrsig is None
+                    ):
+                        cname_rrsig = rr
 
-        ok, key_tag_used = _validate_rrsig_over_rrset(
-            rrset, rrsig_rrset, zone_dnskeys, zone
-        )
-        if ok:
-            print(
-                f"  {GREEN} {_fmt_rrsig(rrsig_rrset[0])} and DNSKEY={key_tag_used} "
-                f"verifies the {rdtype_text} RRset"
+        # ── Case 1: Got the record we wanted ──────────────────────────────────
+        if rrset:
+            print(f"  {GREEN} Found {len(rrset)} {rdtype_text} record(s):")
+            for r in rrset:
+                print(f"  {INFO}   {qname} {rrset.ttl} IN {rdtype_text} {r.to_text()}")
+
+            if not rrsig_rrset:
+                self._fail(f"No RRSIG found over {qname} {rdtype_text} RRset")
+                return False
+
+            ok, key_tag_used = _validate_rrsig_over_rrset(
+                rrset, rrsig_rrset, zone_dnskeys, zone
             )
-        else:
-            self._fail(f"RRSIG over {qname} {rdtype_text} RRset could not be validated")
-            return False
-
-        # Check RRSIG expiry
-        for sig in rrsig_rrset:
-            exp = datetime.fromtimestamp(sig.expiration, tz=timezone.utc)
-            now = datetime.now(tz=timezone.utc)
-            if exp < now:
-                self._fail(
-                    f"RRSIG over {rdtype_text} RRset is EXPIRED (expired {exp.isoformat()})"
+            if ok:
+                print(
+                    f"  {GREEN} {_fmt_rrsig(rrsig_rrset[0])} and DNSKEY={key_tag_used} "
+                    f"verifies the {rdtype_text} RRset"
                 )
             else:
-                days_left = (exp - now).days
-                print(
-                    f"  {GREEN} RRSIG expires {exp.strftime('%Y-%m-%d')} "
-                    f"({days_left} days remaining)"
+                self._fail(
+                    f"RRSIG over {qname} {rdtype_text} RRset could not be validated"
                 )
+                return False
 
-        return True
+            # Check RRSIG expiry
+            for sig in rrsig_rrset:
+                exp = datetime.fromtimestamp(sig.expiration, tz=timezone.utc)
+                now = datetime.now(tz=timezone.utc)
+                if exp < now:
+                    self._fail(
+                        f"RRSIG over {rdtype_text} RRset is EXPIRED "
+                        f"(expired {exp.isoformat()})"
+                    )
+                else:
+                    days_left = (exp - now).days
+                    print(
+                        f"  {GREEN} RRSIG expires {exp.strftime('%Y-%m-%d')} "
+                        f"({days_left} days remaining)"
+                    )
+            return True
+
+        # ── Case 2: Got a CNAME — validate it, then follow the chain ─────────
+        if cname_rrset:
+            cname_target = cname_rrset[0].target.to_text()
+            print(f"  {GREEN} {qname} is a CNAME to {cname_target}")
+
+            # Validate the CNAME RRset with the current zone's keys
+            if not cname_rrsig:
+                self._fail(f"No RRSIG found over {qname} CNAME RRset")
+                return False
+
+            ok, key_tag_used = _validate_rrsig_over_rrset(
+                cname_rrset, cname_rrsig, zone_dnskeys, zone
+            )
+            if ok:
+                print(
+                    f"  {GREEN} {_fmt_rrsig(cname_rrsig[0])} and DNSKEY={key_tag_used} "
+                    f"verifies the CNAME RRset"
+                )
+            else:
+                self._fail(f"RRSIG over {qname} CNAME RRset could not be validated")
+                return False
+
+            # Walk the zone chain for the CNAME target, reusing any zones
+            # already validated in this session (root, TLD, etc.)
+            print(f"\n  Following CNAME → {cname_target}")
+            target_zones = self._build_zone_list(cname_target)
+
+            # Share the caller's validated_keys dict so already-done zones
+            # (root, org., etc.) are not re-walked.
+            shared_keys: dict[str, dns.rrset.RRset] = (
+                validated_keys if validated_keys is not None else {}
+            )
+
+            for i in range(1, len(target_zones)):
+                parent = target_zones[i - 1]
+                child = target_zones[i]
+                if child in shared_keys:
+                    continue  # already validated in a prior walk
+                ok = self._check_zone(
+                    parent_zone=parent,
+                    child_zone=child,
+                    parent_validated_keys=shared_keys[parent],
+                    validated_keys=shared_keys,
+                )
+                if not ok:
+                    return False
+
+            target_zone = target_zones[-1]
+            return self._check_final_rrset(
+                zone=target_zone,
+                zone_dnskeys=shared_keys[target_zone],
+                qname=cname_target,
+                depth=depth + 1,
+                validated_keys=shared_keys,
+            )
+
+        # ── Case 3: Neither the record nor a CNAME was found ─────────────────
+        print(f"  {RED} No {rdtype_text} record found for {qname}")
+        self._fail(f"No {rdtype_text} record for {qname}")
+        return False
 
     # ── Nameserver helpers ────────────────────────────────────────────────────
 
