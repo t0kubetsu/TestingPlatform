@@ -861,7 +861,91 @@ class DNSSECChecker:
                 validated_keys=shared_keys,
             )
 
-        # ── Case 3: Neither the record nor a CNAME was found ─────────────────
+        # ── Case 3: Empty answer — check authority for NSEC NODATA proof ────────
+        # RCODE=NOERROR + empty answer + NSEC in authority = cryptographic proof
+        # that no records of this type exist.  Validate the NSEC RRset and report
+        # success (the name exists but has no A/AAAA/etc. record of this type).
+        nsec_rrset = nsec_rrsig = None
+        for rr in raw_resp.authority:
+            if rr.rdtype == dns.rdatatype.NSEC and rr.name == dns.name.from_text(qname):
+                nsec_rrset = rr
+            elif rr.rdtype == dns.rdatatype.RRSIG:
+                for sig in rr:
+                    if sig.type_covered == dns.rdatatype.NSEC and nsec_rrsig is None:
+                        nsec_rrsig = rr
+
+        if nsec_rrset and raw_resp.rcode() == dns.rcode.NOERROR:
+            print("  Checking NSEC records for a NODATA response")
+
+            if not nsec_rrsig:
+                self._fail(f"No RRSIG found over {qname} NSEC RRset")
+                return False
+
+            ok, key_tag_used = _validate_rrsig_over_rrset(
+                nsec_rrset, nsec_rrsig, zone_dnskeys, zone
+            )
+            if ok:
+                print(
+                    f"  {GREEN} {_fmt_rrsig(nsec_rrsig[0])} and DNSKEY={key_tag_used} "
+                    f"verifies the NSEC RRset"
+                )
+            else:
+                self._fail(f"RRSIG over {qname} NSEC RRset could not be validated")
+                return False
+
+            # Confirm the NSEC bitmap does not include the requested type.
+            # dnspython stores NSEC windows as a list of (window_num, bitmap_bytes).
+            # rdtype = (window_num << 8) | bit_index_within_window
+            nsec_rd = list(nsec_rrset)[0]
+            rdtype_val = int(self.rdtype)
+            window_num = rdtype_val >> 8
+            bit_index = rdtype_val & 0xFF
+            type_in_bitmap = False
+            for win, bitmap in nsec_rd.windows:
+                if win == window_num:
+                    byte_idx, bit_pos = divmod(bit_index, 8)
+                    if byte_idx < len(bitmap) and bitmap[byte_idx] & (0x80 >> bit_pos):
+                        type_in_bitmap = True
+            if type_in_bitmap:
+                # The type IS in the bitmap — the record should exist but wasn't returned
+                self._fail(
+                    f"NSEC bitmap includes {rdtype_text} but no answer was returned "
+                    f"for {qname}"
+                )
+                return False
+
+            print(
+                f"  {GREEN} NSEC proves no records of type {rdtype_text} "
+                f"exist for {qname}"
+            )
+
+            # Also validate the signed SOA in the authority section, which
+            # confirms the zone's own integrity
+            soa_rrset = soa_rrsig = None
+            for rr in raw_resp.authority:
+                if rr.rdtype == dns.rdatatype.SOA and soa_rrset is None:
+                    soa_rrset = rr
+                elif rr.rdtype == dns.rdatatype.RRSIG:
+                    for sig in rr:
+                        if sig.type_covered == dns.rdatatype.SOA and soa_rrsig is None:
+                            soa_rrsig = rr
+
+            if soa_rrset and soa_rrsig:
+                ok, key_tag_used = _validate_rrsig_over_rrset(
+                    soa_rrset, soa_rrsig, zone_dnskeys, zone
+                )
+                if ok:
+                    print(
+                        f"  {GREEN} {_fmt_rrsig(soa_rrsig[0])} and DNSKEY={key_tag_used} "
+                        f"verifies the SOA RRset"
+                    )
+                else:
+                    self._fail(f"RRSIG over {zone} SOA RRset could not be validated")
+                    return False
+
+            return True
+
+        # No NSEC proof and no answer — genuine failure
         print(f"  {RED} No {rdtype_text} record found for {qname}")
         self._fail(f"No {rdtype_text} record for {qname}")
         return False
