@@ -17,6 +17,8 @@ Requirements:
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import logging
 import secrets
 import sys
@@ -255,6 +257,67 @@ def _validate_rrsig_over_rrset(
         except (dns.exception.ValidationFailure, Exception):
             continue
     return False, None
+
+
+# ─── NSEC3 helpers (RFC 5155) ─────────────────────────────────────────────────
+
+# base32hex alphabet (RFC 4648 §7) used by NSEC3 owner names
+_B32_STD = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+_B32_HEX = "0123456789ABCDEFGHIJKLMNOPQRSTUV"
+_TO_B32HEX = str.maketrans(_B32_STD, _B32_HEX)
+_FROM_B32HEX = str.maketrans(_B32_HEX, _B32_STD)
+
+
+def _nsec3_hash(name: str, salt_hex: str, iterations: int) -> str:
+    """Compute the NSEC3 hash of a DNS name (RFC 5155 §5).
+
+    Returns the hash as an uppercase base32hex string (no padding),
+    matching the owner-name prefix used in NSEC3 RRs.
+    """
+    wire = dns.name.from_text(name).canonicalize().to_wire()
+    salt = bytes.fromhex(salt_hex) if salt_hex and salt_hex != "-" else b""
+    digest = wire
+    for _ in range(iterations + 1):
+        digest = hashlib.sha1(digest + salt).digest()
+    b32std = base64.b32encode(digest).decode().upper().rstrip("=")
+    return b32std.translate(_TO_B32HEX)
+
+
+def _nsec3_covers(owner_b32: str, next_b32: str, target_b32: str) -> bool:
+    """Return True if target_b32 falls in the half-open interval
+    (owner_b32, next_b32), with wrap-around for the last record in the chain."""
+    o, n, t = owner_b32.upper(), next_b32.upper(), target_b32.upper()
+    if o < n:  # normal interval
+        return o < t < n
+    else:  # last record wraps around: covers (o, end] ∪ [start, n)
+        return t > o or t < n
+
+
+def _nsec3_type_in_bitmap(nsec3_rd, rdtype: int) -> bool:
+    """Return True if rdtype is set in the NSEC3 type bitmap."""
+    window_num = rdtype >> 8
+    bit_index = rdtype & 0xFF
+    for win, bitmap in nsec3_rd.windows:
+        if win == window_num:
+            byte_idx, bit_pos = divmod(bit_index, 8)
+            if byte_idx < len(bitmap) and bitmap[byte_idx] & (0x80 >> bit_pos):
+                return True
+    return False
+
+
+def _nsec3_owner_hash(rr: dns.rrset.RRset, zone: str) -> str:
+    """Extract the base32hex hash prefix from an NSEC3 owner name.
+
+    NSEC3 owner names look like:
+        JFFEHCP1SILLDV4FFBNLF8GMEBOCAP8O.example.com.
+    We strip the zone suffix and return the hash label in uppercase.
+    """
+    owner = rr.name.to_text().upper()
+    zone_suffix = "." + zone.upper().rstrip(".") + "."
+    if owner.endswith(zone_suffix):
+        return owner[: -len(zone_suffix)]
+    # fallback: first label
+    return owner.split(".")[0]
 
 
 # ─── Main checker class ───────────────────────────────────────────────────────
@@ -947,14 +1010,9 @@ class DNSSECChecker:
 
         # ── Case 4: NXDOMAIN — the name does not exist ───────────────────────
         if raw_resp.rcode() == dns.rcode.NXDOMAIN:
-            # Check whether the zone uses NSEC3 (hashed denial-of-existence).
-            # Full NSEC3 validation is not implemented (mirrors Verisign behaviour);
-            # we validate the signed SOA to confirm zone integrity and report
-            # the NXDOMAIN as a verified non-existence rather than an error.
-            has_nsec3 = any(
-                rr.rdtype == dns.rdatatype.NSEC3 for rr in raw_resp.authority
-            )
+            print(f"  Zone {zone} returns NXDOMAIN for {qname}")
 
+            # Validate signed SOA first (zone integrity)
             soa_rrset = soa_rrsig = None
             for rr in raw_resp.authority:
                 if rr.rdtype == dns.rdatatype.SOA and soa_rrset is None:
@@ -963,8 +1021,6 @@ class DNSSECChecker:
                     for sig in rr:
                         if sig.type_covered == dns.rdatatype.SOA and soa_rrsig is None:
                             soa_rrsig = rr
-
-            print(f"  Zone {zone} returns NXDOMAIN for {qname}")
 
             if soa_rrset and soa_rrsig:
                 ok, key_tag_used = _validate_rrsig_over_rrset(
@@ -979,8 +1035,57 @@ class DNSSECChecker:
                     self._fail(f"RRSIG over {zone} SOA RRset could not be validated")
                     return False
 
-            if has_nsec3:
-                print("  NSEC3 validation not implemented yet")
+            # Try NSEC3 proof of non-existence
+            nsec3_rrs = [
+                rr for rr in raw_resp.authority if rr.rdtype == dns.rdatatype.NSEC3
+            ]
+            if nsec3_rrs:
+                nsec3_ok = self._validate_nsec3_nxdomain(
+                    qname, zone, raw_resp.authority, zone_dnskeys
+                )
+                if not nsec3_ok:
+                    return False
+
+            self._fail(f"NXDOMAIN: {qname} does not exist in zone {zone}")
+            return False
+
+        # ── Case 4: NXDOMAIN — the name does not exist ───────────────────────
+        if raw_resp.rcode() == dns.rcode.NXDOMAIN:
+            print(f"  Zone {zone} returns NXDOMAIN for {qname}")
+
+            # Validate signed SOA first (zone integrity)
+            soa_rrset = soa_rrsig = None
+            for rr in raw_resp.authority:
+                if rr.rdtype == dns.rdatatype.SOA and soa_rrset is None:
+                    soa_rrset = rr
+                elif rr.rdtype == dns.rdatatype.RRSIG:
+                    for sig in rr:
+                        if sig.type_covered == dns.rdatatype.SOA and soa_rrsig is None:
+                            soa_rrsig = rr
+
+            if soa_rrset and soa_rrsig:
+                ok, key_tag_used = _validate_rrsig_over_rrset(
+                    soa_rrset, soa_rrsig, zone_dnskeys, zone
+                )
+                if ok:
+                    print(
+                        f"  {GREEN} {_fmt_rrsig(soa_rrsig[0])} and DNSKEY={key_tag_used} "
+                        f"verifies the SOA RRset"
+                    )
+                else:
+                    self._fail(f"RRSIG over {zone} SOA RRset could not be validated")
+                    return False
+
+            # Try NSEC3 proof of non-existence
+            nsec3_rrs = [
+                rr for rr in raw_resp.authority if rr.rdtype == dns.rdatatype.NSEC3
+            ]
+            if nsec3_rrs:
+                nsec3_ok = self._validate_nsec3_nxdomain(
+                    qname, zone, raw_resp.authority, zone_dnskeys
+                )
+                if not nsec3_ok:
+                    return False
 
             self._fail(f"NXDOMAIN: {qname} does not exist in zone {zone}")
             return False
@@ -990,7 +1095,145 @@ class DNSSECChecker:
         self._fail(f"No {rdtype_text} record for {qname}")
         return False
 
-    # ── Nameserver helpers ────────────────────────────────────────────────────
+    def _validate_nsec3_nxdomain(
+        self,
+        qname: str,
+        zone: str,
+        authority: list,
+        zone_dnskeys: dns.rrset.RRset,
+    ) -> bool:
+        """Validate NSEC3 denial-of-existence proof for an NXDOMAIN response.
+
+        RFC 5155 §8.3 — closest encloser proof:
+          1. Closest encloser match  — an NSEC3 whose hash exactly matches
+             an ancestor of qname that *does* exist in the zone.
+          2. Next closer name cover  — an NSEC3 whose hash range covers the
+             hash of the one-label-longer name just below the closest encloser.
+          3. Wildcard cover          — an NSEC3 whose hash range covers the
+             hash of *.closest_encloser.
+
+        All matched NSEC3 RRsets must have their RRSIG validated.
+        """
+        # Collect all NSEC3 rrsets and build a map: owner_hash → (rrset, rd)
+        nsec3_map: dict[str, tuple[dns.rrset.RRset, object]] = {}
+        nsec3_rrsigs: dict[str, dns.rrset.RRset] = {}
+
+        for rr in authority:
+            if rr.rdtype == dns.rdatatype.NSEC3:
+                h = _nsec3_owner_hash(rr, zone)
+                nsec3_map[h] = (rr, list(rr)[0])
+            elif rr.rdtype == dns.rdatatype.RRSIG:
+                for sig in rr:
+                    if sig.type_covered == dns.rdatatype.NSEC3:
+                        h = _nsec3_owner_hash(rr, zone)
+                        nsec3_rrsigs[h] = rr
+
+        if not nsec3_map:
+            return True  # nothing to validate
+
+        # Read hash parameters from the first NSEC3 record
+        first_rd = next(iter(nsec3_map.values()))[1]
+        iterations = first_rd.iterations
+        salt_hex = first_rd.salt.hex() if first_rd.salt else "-"
+        print(
+            f"  Checking NSEC3 records (iterations={iterations}, "
+            f"salt={'- ' if salt_hex == '-' else salt_hex})"
+        )
+
+        def validate_nsec3_rrset(owner_hash: str, label: str) -> bool:
+            """Validate the RRSIG over the NSEC3 RRset identified by owner_hash."""
+            if owner_hash not in nsec3_map:
+                return False
+            rrset = nsec3_map[owner_hash][0]
+            rrsig = nsec3_rrsigs.get(owner_hash)
+            if not rrsig:
+                self._fail(f"No RRSIG over NSEC3 record covering {label}")
+                return False
+            ok, key_tag = _validate_rrsig_over_rrset(rrset, rrsig, zone_dnskeys, zone)
+            if ok:
+                print(
+                    f"  {GREEN} {_fmt_rrsig(rrsig[0])} and DNSKEY={key_tag} "
+                    f"verifies the NSEC3 RRset ({label})"
+                )
+            else:
+                self._fail(
+                    f"RRSIG over NSEC3 record for {label} could not be validated"
+                )
+            return ok
+
+        def find_covering(target_hash: str) -> Optional[str]:
+            """Return the owner_hash of the NSEC3 record that covers target_hash,
+            or None if no record covers it."""
+            for owner_hash, (_, rd) in nsec3_map.items():
+                next_hash = base64.b32encode(rd.next).decode().upper().rstrip("=")
+                next_hash = next_hash.translate(_TO_B32HEX)
+                if _nsec3_covers(owner_hash, next_hash, target_hash):
+                    return owner_hash
+            return None
+
+        # ── Closest encloser proof ────────────────────────────────────────────
+        # Walk up from qname looking for an ancestor whose hash appears as an
+        # NSEC3 owner name (exact match = exists in zone = closest encloser).
+        qname_stripped = qname.rstrip(".")
+        labels = qname_stripped.split(".")
+        closest_encloser: Optional[str] = None
+
+        for i in range(len(labels)):
+            candidate = ".".join(labels[i:]) + "."
+            h = _nsec3_hash(candidate, salt_hex, iterations)
+            if h in nsec3_map:
+                closest_encloser = candidate
+                print(f"  {GREEN} Closest encloser: {candidate} (hash {h[:16]}…)")
+                if not validate_nsec3_rrset(h, f"closest encloser {candidate}"):
+                    return False
+                break
+
+        if closest_encloser is None:
+            # Fall back to zone apex as closest encloser
+            closest_encloser = zone if zone.endswith(".") else zone + "."
+
+        # ── Next closer name cover ────────────────────────────────────────────
+        # The next closer name is the child of the closest encloser that is
+        # on the path to qname (one label longer than closest_encloser).
+        ce_labels = closest_encloser.rstrip(".").split(".")
+        q_labels = qname_stripped.split(".")
+        # number of labels in closest encloser
+        ce_depth = len(ce_labels)
+        if len(q_labels) > ce_depth:
+            next_closer = ".".join(q_labels[-(ce_depth + 1) :]) + "."
+            nc_hash = _nsec3_hash(next_closer, salt_hex, iterations)
+            covering = find_covering(nc_hash)
+            if covering:
+                print(
+                    f"  {GREEN} Next closer name {next_closer} "
+                    f"(hash {nc_hash[:16]}…) is covered by NSEC3"
+                )
+                if not validate_nsec3_rrset(covering, f"next closer {next_closer}"):
+                    return False
+            else:
+                self._fail(f"No NSEC3 record covers next closer name {next_closer}")
+                return False
+
+        # ── Wildcard cover ────────────────────────────────────────────────────
+        wildcard = "*." + closest_encloser
+        wc_hash = _nsec3_hash(wildcard, salt_hex, iterations)
+        wc_covering = find_covering(wc_hash)
+        # Exact match means a wildcard exists — should not happen for NXDOMAIN
+        if wc_hash in nsec3_map:
+            self._fail(f"Wildcard {wildcard} exists but NXDOMAIN was returned")
+            return False
+        if wc_covering:
+            print(
+                f"  {GREEN} Wildcard {wildcard} (hash {wc_hash[:16]}…) "
+                f"is covered by NSEC3 — no wildcard expansion"
+            )
+            if not validate_nsec3_rrset(wc_covering, f"wildcard {wildcard}"):
+                return False
+        # (absence of wildcard cover is allowed when opt-out is in use)
+
+        return True
+
+        # ── Nameserver helpers ────────────────────────────────────────────────────
 
     def _get_ns_ip_for_zone(self, zone: str, validated_keys: dict) -> Optional[str]:
         """Return an authoritative NS IP for zone, using the map built during
