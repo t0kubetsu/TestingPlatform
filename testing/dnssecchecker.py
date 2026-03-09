@@ -346,6 +346,11 @@ class DNSSECChecker:
         self.domain = dns.name.from_text(
             domain
         ).to_text()  # canonical with trailing dot
+        valid_types = {t.name for t in dns.rdatatype.RdataType}
+        if record_type.upper() not in valid_types:
+            print(f"Error: unknown record type '{record_type}'.")
+            print(f"Known types: {', '.join(sorted(valid_types))}")
+            sys.exit(2)
         self.rdtype = dns.rdatatype.from_text(record_type)
         self.errors: list[str] = []
         self.warnings: list[str] = []
