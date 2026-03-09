@@ -393,6 +393,10 @@ class DNSSECChecker:
                 print(f"     • {e}")
         else:
             print(f"  {GREEN}  Full chain-of-trust validated successfully!")
+        if self.warnings:
+            print(f"  ⚠️   {len(self.warnings)} warning(s)")
+            for w in self.warnings:
+                print(f"     • {w}")
         print(f"{'=' * 70}\n")
 
         return not bool(self.errors)
@@ -408,11 +412,11 @@ class DNSSECChecker:
         the authoritative NS IPs for each zone, so downstream methods can query
         the correct servers.
 
-            example.com     → ['.', 'com.', 'example.com.']
-            www.example.com → ['.', 'com.', 'example.com.']
+            nc3.lu             → ['.', 'lu.', 'nc3.lu.']
+            observatory.nc3.lu → ['.', 'lu.', 'nc3.lu.']
         """
         name = dns.name.from_text(fqdn)
-        labels = name.labels  # e.g. (b'www', b'example', b'com', b'')
+        labels = name.labels  # e.g. (b'observatory', b'nc3', b'lu', b'')
 
         # Ordered candidate zones from TLD down to fqdn itself
         candidates: list[str] = []
@@ -1046,48 +1050,7 @@ class DNSSECChecker:
                 if not nsec3_ok:
                     return False
 
-            self._fail(f"NXDOMAIN: {qname} does not exist in zone {zone}")
-            return False
-
-        # ── Case 4: NXDOMAIN — the name does not exist ───────────────────────
-        if raw_resp.rcode() == dns.rcode.NXDOMAIN:
-            print(f"  Zone {zone} returns NXDOMAIN for {qname}")
-
-            # Validate signed SOA first (zone integrity)
-            soa_rrset = soa_rrsig = None
-            for rr in raw_resp.authority:
-                if rr.rdtype == dns.rdatatype.SOA and soa_rrset is None:
-                    soa_rrset = rr
-                elif rr.rdtype == dns.rdatatype.RRSIG:
-                    for sig in rr:
-                        if sig.type_covered == dns.rdatatype.SOA and soa_rrsig is None:
-                            soa_rrsig = rr
-
-            if soa_rrset and soa_rrsig:
-                ok, key_tag_used = _validate_rrsig_over_rrset(
-                    soa_rrset, soa_rrsig, zone_dnskeys, zone
-                )
-                if ok:
-                    print(
-                        f"  {GREEN} {_fmt_rrsig(soa_rrsig[0])} and DNSKEY={key_tag_used} "
-                        f"verifies the SOA RRset"
-                    )
-                else:
-                    self._fail(f"RRSIG over {zone} SOA RRset could not be validated")
-                    return False
-
-            # Try NSEC3 proof of non-existence
-            nsec3_rrs = [
-                rr for rr in raw_resp.authority if rr.rdtype == dns.rdatatype.NSEC3
-            ]
-            if nsec3_rrs:
-                nsec3_ok = self._validate_nsec3_nxdomain(
-                    qname, zone, raw_resp.authority, zone_dnskeys
-                )
-                if not nsec3_ok:
-                    return False
-
-            self._fail(f"NXDOMAIN: {qname} does not exist in zone {zone}")
+            self._warn(f"NXDOMAIN: {qname} does not exist in zone {zone}")
             return False
 
         # No NSEC proof and no answer — genuine failure
@@ -1233,7 +1196,7 @@ class DNSSECChecker:
 
         return True
 
-        # ── Nameserver helpers ────────────────────────────────────────────────────
+    # ── Nameserver helpers ────────────────────────────────────────────────────
 
     def _get_ns_ip_for_zone(self, zone: str, validated_keys: dict) -> Optional[str]:
         """Return an authoritative NS IP for zone, using the map built during
@@ -1303,6 +1266,10 @@ class DNSSECChecker:
     def _fail(self, msg: str):
         self.errors.append(msg)
         print(f"  {RED} ERROR: {msg}")
+
+    def _warn(self, msg: str):
+        self.warnings.append(msg)
+        print(f"  ⚠️  WARNING: {msg}")
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
