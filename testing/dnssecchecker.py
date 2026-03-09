@@ -343,9 +343,24 @@ class DNSSECChecker:
     """
 
     def __init__(self, domain: str, record_type: str = "A"):
-        self.domain = dns.name.from_text(
-            domain
-        ).to_text()  # canonical with trailing dot
+        # Validate the domain name before doing anything
+        try:
+            parsed = dns.name.from_text(domain)
+        except dns.exception.DNSException as exc:
+            print(f"Error: invalid domain name '{domain}': {exc}")
+            sys.exit(2)
+
+        # Must have at least two labels (name + TLD), e.g. "example.com"
+        # A bare single-label name like "example" is not a valid public domain.
+        non_empty_labels = [l for l in parsed.labels if l]
+        if len(non_empty_labels) < 2:
+            print(
+                f"Error: '{domain}' is not a valid fully-qualified domain name. "
+                f"Please include a TLD, e.g. '{domain}.com'."
+            )
+            sys.exit(2)
+
+        self.domain = parsed.to_text()  # canonical with trailing dot
         valid_types = {t.name for t in dns.rdatatype.RdataType}
         if record_type.upper() not in valid_types:
             print(f"Error: unknown record type '{record_type}'.")
