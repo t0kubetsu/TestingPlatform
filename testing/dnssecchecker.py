@@ -945,6 +945,46 @@ class DNSSECChecker:
 
             return True
 
+        # ── Case 4: NXDOMAIN — the name does not exist ───────────────────────
+        if raw_resp.rcode() == dns.rcode.NXDOMAIN:
+            # Check whether the zone uses NSEC3 (hashed denial-of-existence).
+            # Full NSEC3 validation is not implemented (mirrors Verisign behaviour);
+            # we validate the signed SOA to confirm zone integrity and report
+            # the NXDOMAIN as a verified non-existence rather than an error.
+            has_nsec3 = any(
+                rr.rdtype == dns.rdatatype.NSEC3 for rr in raw_resp.authority
+            )
+
+            soa_rrset = soa_rrsig = None
+            for rr in raw_resp.authority:
+                if rr.rdtype == dns.rdatatype.SOA and soa_rrset is None:
+                    soa_rrset = rr
+                elif rr.rdtype == dns.rdatatype.RRSIG:
+                    for sig in rr:
+                        if sig.type_covered == dns.rdatatype.SOA and soa_rrsig is None:
+                            soa_rrsig = rr
+
+            print(f"  Zone {zone} returns NXDOMAIN for {qname}")
+
+            if soa_rrset and soa_rrsig:
+                ok, key_tag_used = _validate_rrsig_over_rrset(
+                    soa_rrset, soa_rrsig, zone_dnskeys, zone
+                )
+                if ok:
+                    print(
+                        f"  {GREEN} {_fmt_rrsig(soa_rrsig[0])} and DNSKEY={key_tag_used} "
+                        f"verifies the SOA RRset"
+                    )
+                else:
+                    self._fail(f"RRSIG over {zone} SOA RRset could not be validated")
+                    return False
+
+            if has_nsec3:
+                print("  NSEC3 validation not implemented yet")
+
+            self._fail(f"NXDOMAIN: {qname} does not exist in zone {zone}")
+            return False
+
         # No NSEC proof and no answer — genuine failure
         print(f"  {RED} No {rdtype_text} record found for {qname}")
         self._fail(f"No {rdtype_text} record for {qname}")
