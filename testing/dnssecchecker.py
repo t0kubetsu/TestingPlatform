@@ -115,7 +115,9 @@ def _udp_query(
     port: int = DNS_PORT,
     timeout: float = DNS_TIMEOUT,
 ) -> dns.message.Message:
-    """Send a DNSSEC-enabled UDP query and return the raw response."""
+    """Send a DNSSEC-enabled UDP query, falling back to TCP if the response
+    is truncated (TC flag set).  Large RRsets such as DNSKEY frequently
+    exceed the 512-byte UDP limit even with EDNS0."""
     q = dns.message.make_query(qname, rdtype, want_dnssec=True)
     try:
         resp = dns.query.udp(q, nameserver, timeout=timeout, port=port)
@@ -124,6 +126,15 @@ def _udp_query(
             f"UDP query for {qname}/{dns.rdatatype.to_text(rdtype)} "
             f"to {nameserver} failed: {exc}"
         ) from exc
+    if resp.flags & dns.flags.TC:
+        # Response was truncated — retry over TCP
+        try:
+            resp = dns.query.tcp(q, nameserver, timeout=timeout, port=port)
+        except Exception as exc:
+            raise RuntimeError(
+                f"TCP fallback for {qname}/{dns.rdatatype.to_text(rdtype)} "
+                f"to {nameserver} failed: {exc}"
+            ) from exc
     return resp
 
 
